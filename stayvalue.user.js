@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         StayValue
 // @namespace    https://github.com/chaoxu/stayvalue
-// @version      1.12.0
+// @version      1.15.0
 // @description  Compare hotel point rates vs cash rates - shows cents-per-point (cpp) and highlights better value
 // @match        https://www.ihg.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -13,12 +14,18 @@
     'use strict';
 
     // ============================================
-    // USER CONFIGURATION - Adjust these values!
+    // USER CONFIGURATION
     // ============================================
+    // User-configurable values (can be changed via Tampermonkey menu)
+    const USER_CONFIG = {
+        pointValue: GM_getValue('pointValue', 0.5),           // cents per point valuation
+        cashbackRate: GM_getValue('cashbackRate', 0.05),      // % cashback on total price
+        travelAgentRebateRate: GM_getValue('travelAgentRebateRate', 0.07),  // % rebate on room rate
+        dollarDecimals: GM_getValue('dollarDecimals', 0)      // decimal places for dollar amounts (0, 1, or 2)
+    };
+
     const CONFIG = {
         IHG: {
-            pointValue: 0.5,  // Your personal valuation in cents per point
-            cashbackRate: 0.05,  // 5% cashback on total price (credit card, portal, etc.)
             // Base points per dollar by brand (default 10, some brands earn less)
             brandBasePoints: {
                 'default': 10,
@@ -51,6 +58,63 @@
         // Debug mode - set to true to see console logs
         debug: true  // Enabled for initial testing
     };
+
+    // ============================================
+    // MENU COMMANDS FOR USER CONFIGURATION
+    // ============================================
+    function setupMenuCommands() {
+        GM_registerMenuCommand(`Set Point Value (current: ${USER_CONFIG.pointValue}¢)`, () => {
+            const value = prompt('Enter your point valuation in cents (e.g., 0.5 for half a cent):', USER_CONFIG.pointValue);
+            if (value !== null) {
+                const num = parseFloat(value);
+                if (!isNaN(num) && num >= 0) {
+                    GM_setValue('pointValue', num);
+                    alert(`Point value set to ${num}¢. Refresh the page to apply.`);
+                } else {
+                    alert('Invalid value. Please enter a number >= 0.');
+                }
+            }
+        });
+
+        GM_registerMenuCommand(`Set Cashback Rate (current: ${(USER_CONFIG.cashbackRate * 100).toFixed(1)}%)`, () => {
+            const value = prompt('Enter your cashback rate as a percentage (e.g., 5 for 5%):', USER_CONFIG.cashbackRate * 100);
+            if (value !== null) {
+                const num = parseFloat(value) / 100;
+                if (!isNaN(num) && num >= 0 && num <= 1) {
+                    GM_setValue('cashbackRate', num);
+                    alert(`Cashback rate set to ${(num * 100).toFixed(1)}%. Refresh the page to apply.`);
+                } else {
+                    alert('Invalid value. Please enter a percentage between 0 and 100.');
+                }
+            }
+        });
+
+        GM_registerMenuCommand(`Set Travel Agent Rebate (current: ${(USER_CONFIG.travelAgentRebateRate * 100).toFixed(1)}%)`, () => {
+            const value = prompt('Enter travel agent rebate rate as a percentage (e.g., 7 for 7%, 0 to disable):', USER_CONFIG.travelAgentRebateRate * 100);
+            if (value !== null) {
+                const num = parseFloat(value) / 100;
+                if (!isNaN(num) && num >= 0 && num <= 1) {
+                    GM_setValue('travelAgentRebateRate', num);
+                    alert(`Travel agent rebate set to ${(num * 100).toFixed(1)}%. Refresh the page to apply.`);
+                } else {
+                    alert('Invalid value. Please enter a percentage between 0 and 100.');
+                }
+            }
+        });
+
+        GM_registerMenuCommand(`Set Dollar Decimals (current: ${USER_CONFIG.dollarDecimals})`, () => {
+            const value = prompt('Enter number of decimal places for dollar amounts (0, 1, or 2):', USER_CONFIG.dollarDecimals);
+            if (value !== null) {
+                const num = parseInt(value, 10);
+                if (!isNaN(num) && num >= 0 && num <= 2) {
+                    GM_setValue('dollarDecimals', num);
+                    alert(`Dollar decimals set to ${num}. Refresh the page to apply.`);
+                } else {
+                    alert('Invalid value. Please enter 0, 1, or 2.');
+                }
+            }
+        });
+    }
 
     // ============================================
     // USER PROFILE (from API response)
@@ -540,6 +604,23 @@
         return cpp.toFixed(2) + ' cpp';
     }
 
+    // Format dollar amount for display (configurable decimal places)
+    function fmtDollars(amount) {
+        if (amount === null || amount === undefined) return '?';
+        return amount.toFixed(USER_CONFIG.dollarDecimals);
+    }
+
+    // Format points for display (rounded integer with commas)
+    function fmtPoints(points) {
+        if (points === null || points === undefined) return '?';
+        return Math.round(points).toLocaleString();
+    }
+
+    // Format percentage for display
+    function fmtPercent(rate) {
+        return (rate * 100).toFixed(1);
+    }
+
     function isGoodValue(cpp, threshold) {
         return cpp !== null && cpp >= threshold;
     }
@@ -549,7 +630,7 @@
     function calculatePointsEffectiveCost(points) {
         if (!points || points <= 0) return null;
         // pointValue is in cents, convert to dollars
-        return points * CONFIG.IHG.pointValue / 100;
+        return points * USER_CONFIG.pointValue / 100;
     }
 
     // Determine the best rate between cash and points
@@ -664,17 +745,20 @@
         return candidates[0];
     }
 
-    // Calculate cash effective cost with bonus points
+    // Calculate cash effective cost with bonus points and rebates
     function calculateCashEffectiveCostWithBonus(totalUSD, roomRateUSD, bonusPoints, brandCode) {
-        const cashback = totalUSD * CONFIG.IHG.cashbackRate;
+        const cashback = totalUSD * USER_CONFIG.cashbackRate;
+        const travelAgentRebate = roomRateUSD * USER_CONFIG.travelAgentRebateRate;
         const basePointsEarned = roomRateUSD * getPointsPerDollar(brandCode);
         const totalPointsEarned = basePointsEarned + bonusPoints;
-        const pointsValue = totalPointsEarned * CONFIG.IHG.pointValue / 100;
-        const effectiveCost = totalUSD - cashback - pointsValue;
+        const pointsValue = totalPointsEarned * USER_CONFIG.pointValue / 100;
+        const effectiveCost = totalUSD - cashback - travelAgentRebate - pointsValue;
 
         return {
             grossCost: totalUSD,
+            roomRate: roomRateUSD,
             cashback: cashback,
+            travelAgentRebate: travelAgentRebate,
             basePointsEarned: basePointsEarned,
             bonusPoints: bonusPoints,
             totalPointsEarned: totalPointsEarned,
@@ -814,12 +898,12 @@
             if (points) {
                 // Use best cash rate for CPP calculation
                 const effCalc = bestCashRate.effectiveCalc;
-                // Net cost = gross - cashback (don't subtract points value for CPP)
-                const netCashCost = effCalc.grossCost - effCalc.cashback;
+                // Net cost = gross - cashback - travel agent rebate (don't subtract points value for CPP)
+                const netCashCost = effCalc.grossCost - effCalc.cashback - effCalc.travelAgentRebate;
                 // Net points = points to redeem + total points earned (base + bonus)
                 netPoints = points + effCalc.totalPointsEarned;
                 cpp = calculateCPP(netCashCost, points, effCalc.totalPointsEarned);
-                isGood = isGoodValue(cpp, CONFIG.IHG.pointValue);
+                isGood = isGoodValue(cpp, USER_CONFIG.pointValue);
             }
 
             const eliteLevel = getUserEliteLevel();
@@ -896,34 +980,31 @@
                 // Build tooltip with full breakdown
                 const calc = cashData.cashEffectiveCalc;
                 const best = cashData.bestCashRate;
-                const netCost = (calc.grossCost - calc.cashback).toFixed(0);
-                const grossCost = calc.grossCost.toFixed(0);
-                const roomCost = best.roomRateUSD.toFixed(0);
-                const cashback = calc.cashback.toFixed(0);
-                const totalPointsEarned = calc.totalPointsEarned.toFixed(0);
-                const netPoints = cashData.netPoints.toFixed(0);
-                const redeemPoints = cashData.points.toFixed(0);
+                const netCost = calc.grossCost - calc.cashback - calc.travelAgentRebate;
 
                 // Build gross breakdown (only show fees/tax if > 0)
-                let grossBreakdown = `$${roomCost} room`;
-                if (best.feesUSD > 0) grossBreakdown += ` + $${best.feesUSD.toFixed(0)} fees`;
-                if (best.taxesUSD > 0) grossBreakdown += ` + $${best.taxesUSD.toFixed(0)} tax`;
+                let grossBreakdown = `$${fmtDollars(best.roomRateUSD)} room`;
+                if (best.feesUSD > 0) grossBreakdown += ` + $${fmtDollars(best.feesUSD)} fees`;
+                if (best.taxesUSD > 0) grossBreakdown += ` + $${fmtDollars(best.taxesUSD)} tax`;
 
                 let tooltip = `Best cash rate: ${best.rateCode}`;
                 if (calc.bonusPoints > 0) {
-                    tooltip += ` (+${calc.bonusPoints.toLocaleString()} bonus)`;
+                    tooltip += ` (+${fmtPoints(calc.bonusPoints)} bonus)`;
                 }
-                tooltip += `\n  Gross: $${grossCost} (${grossBreakdown})\n`;
-                tooltip += `  Cashback (${(CONFIG.IHG.cashbackRate * 100).toFixed(0)}%): -$${cashback}\n`;
-                tooltip += `  Net cost: $${netCost}\n`;
-                tooltip += `  Points earned: ${totalPointsEarned}`;
+                tooltip += `\n  Gross: $${fmtDollars(calc.grossCost)} (${grossBreakdown})\n`;
+                tooltip += `  Cashback (${fmtPercent(USER_CONFIG.cashbackRate)}%): -$${fmtDollars(calc.cashback)}\n`;
+                if (USER_CONFIG.travelAgentRebateRate > 0) {
+                    tooltip += `  TA Rebate (${fmtPercent(USER_CONFIG.travelAgentRebateRate)}%): -$${fmtDollars(calc.travelAgentRebate)}\n`;
+                }
+                tooltip += `  Net cost: $${fmtDollars(netCost)}\n`;
+                tooltip += `  Points earned: ${fmtPoints(calc.totalPointsEarned)}`;
                 if (calc.bonusPoints > 0) {
-                    tooltip += ` (${calc.basePointsEarned.toFixed(0)} base + ${calc.bonusPoints} bonus)`;
+                    tooltip += ` (${fmtPoints(calc.basePointsEarned)} base + ${fmtPoints(calc.bonusPoints)} bonus)`;
                 }
                 tooltip += `\n\nPoints booking:\n`;
-                tooltip += `  Points needed: ${redeemPoints}\n`;
-                tooltip += `  Foregone earnings: ${totalPointsEarned}\n`;
-                tooltip += `  Net points: ${netPoints}\n\n`;
+                tooltip += `  Points needed: ${fmtPoints(cashData.points)}\n`;
+                tooltip += `  Foregone earnings: ${fmtPoints(calc.totalPointsEarned)}\n`;
+                tooltip += `  Net points: ${fmtPoints(cashData.netPoints)}\n\n`;
                 tooltip += `Elite: ${cashData.eliteLevel}`;
 
                 cppEl.title = tooltip;
@@ -947,23 +1028,23 @@
             // Format cash label with bonus points indicator if applicable
             const bonusPoints = bestCashRate?.bonusPoints || 0;
             const bonusLabel = bonusPoints > 0
-                ? ` (+${(bonusPoints / 1000).toFixed(0)}k)`
+                ? ` (+${Math.round(bonusPoints / 1000)}k)`
                 : '';
-            const cashCostStr = bestRateInfo.cashCost !== null ? `$${bestRateInfo.cashCost.toFixed(0)}` : 'N/A';
-            const pointsCostStr = bestRateInfo.pointsCost !== null ? `$${bestRateInfo.pointsCost.toFixed(0)}` : 'N/A';
+            const cashCostStr = bestRateInfo.cashCost !== null ? `$${fmtDollars(bestRateInfo.cashCost)}` : 'N/A';
+            const pointsCostStr = bestRateInfo.pointsCost !== null ? `$${fmtDollars(bestRateInfo.pointsCost)}` : 'N/A';
 
             if (bestRateInfo.bestRate === 'points' && bestRateInfo.pointsCost !== null) {
                 // Points is better
                 bestRow.innerHTML = `<span class="best">Points ${pointsCostStr}</span> <span class="alt">vs Cash${bonusLabel} ${cashCostStr}</span>`;
                 if (bestRateInfo.savings !== null && bestRateInfo.savings > 0) {
-                    bestRow.innerHTML += ` <span class="savings">(save $${bestRateInfo.savings.toFixed(0)})</span>`;
+                    bestRow.innerHTML += ` <span class="savings">(save $${fmtDollars(bestRateInfo.savings)})</span>`;
                 }
             } else if (bestRateInfo.bestRate === 'cash') {
                 // Cash is better (or only option)
                 if (bestRateInfo.pointsCost !== null) {
                     bestRow.innerHTML = `<span class="best">Cash${bonusLabel} ${cashCostStr}</span> <span class="alt">vs Points ${pointsCostStr}</span>`;
                     if (bestRateInfo.savings !== null && bestRateInfo.savings > 0) {
-                        bestRow.innerHTML += ` <span class="savings">(save $${bestRateInfo.savings.toFixed(0)})</span>`;
+                        bestRow.innerHTML += ` <span class="savings">(save $${fmtDollars(bestRateInfo.savings)})</span>`;
                     }
                 } else {
                     // Only cash available
@@ -975,34 +1056,37 @@
             const effCalc = cashData.cashEffectiveCalc;
 
             // Build gross breakdown (only show fees/tax if > 0)
-            let grossBreakdown = `$${bestCashRate?.roomRateUSD?.toFixed(0) || '?'} room`;
-            if (bestCashRate?.feesUSD > 0) grossBreakdown += ` + $${bestCashRate.feesUSD.toFixed(0)} fees`;
-            if (bestCashRate?.taxesUSD > 0) grossBreakdown += ` + $${bestCashRate.taxesUSD.toFixed(0)} tax`;
+            let grossBreakdown = `$${fmtDollars(bestCashRate?.roomRateUSD)} room`;
+            if (bestCashRate?.feesUSD > 0) grossBreakdown += ` + $${fmtDollars(bestCashRate.feesUSD)} fees`;
+            if (bestCashRate?.taxesUSD > 0) grossBreakdown += ` + $${fmtDollars(bestCashRate.taxesUSD)} tax`;
 
             let tooltip = `Effective cost comparison:\n\n`;
             tooltip += `Best cash rate: ${bestCashRate?.rateCode || 'lowest'}`;
             if (bonusPoints > 0) {
-                tooltip += ` (+${bonusPoints.toLocaleString()} bonus pts)`;
+                tooltip += ` (+${fmtPoints(bonusPoints)} bonus pts)`;
             }
             tooltip += `\n`;
-            tooltip += `  Gross: $${effCalc.grossCost.toFixed(0)} (${grossBreakdown})\n`;
-            tooltip += `  Cashback (${(CONFIG.IHG.cashbackRate * 100).toFixed(0)}%): -$${effCalc.cashback.toFixed(0)}\n`;
-            if (effCalc.basePointsEarned !== undefined) {
-                tooltip += `  Base points: ${effCalc.basePointsEarned.toFixed(0)}\n`;
-                if (bonusPoints > 0) {
-                    tooltip += `  Bonus points: +${bonusPoints}\n`;
-                }
-                tooltip += `  Total points: ${effCalc.totalPointsEarned.toFixed(0)}\n`;
-            } else {
-                tooltip += `  Points earned: ${effCalc.pointsEarned?.toFixed(0) || 0}\n`;
+            tooltip += `  Gross: $${fmtDollars(effCalc.grossCost)} (${grossBreakdown})\n`;
+            tooltip += `  Cashback (${fmtPercent(USER_CONFIG.cashbackRate)}%): -$${fmtDollars(effCalc.cashback)}\n`;
+            if (USER_CONFIG.travelAgentRebateRate > 0) {
+                tooltip += `  TA Rebate (${fmtPercent(USER_CONFIG.travelAgentRebateRate)}%): -$${fmtDollars(effCalc.travelAgentRebate)}\n`;
             }
-            tooltip += `  Points value (${CONFIG.IHG.pointValue}¢/pt): -$${effCalc.pointsValue.toFixed(0)}\n`;
-            tooltip += `  Effective cost: $${effCalc.effectiveCost.toFixed(0)}\n\n`;
+            if (effCalc.basePointsEarned !== undefined) {
+                tooltip += `  Base points: ${fmtPoints(effCalc.basePointsEarned)}\n`;
+                if (bonusPoints > 0) {
+                    tooltip += `  Bonus points: +${fmtPoints(bonusPoints)}\n`;
+                }
+                tooltip += `  Total points: ${fmtPoints(effCalc.totalPointsEarned)}\n`;
+            } else {
+                tooltip += `  Points earned: ${fmtPoints(effCalc.pointsEarned)}\n`;
+            }
+            tooltip += `  Points value (${USER_CONFIG.pointValue}¢/pt): -$${fmtDollars(effCalc.pointsValue)}\n`;
+            tooltip += `  Effective cost: $${fmtDollars(effCalc.effectiveCost)}\n\n`;
 
             if (bestRateInfo.pointsCost !== null && cashData.points) {
                 tooltip += `Points redemption:\n`;
-                tooltip += `  Points to redeem: ${cashData.points.toLocaleString()}\n`;
-                tooltip += `  Point value (${CONFIG.IHG.pointValue}¢/pt): $${bestRateInfo.pointsCost.toFixed(0)}\n`;
+                tooltip += `  Points to redeem: ${fmtPoints(cashData.points)}\n`;
+                tooltip += `  Point value (${USER_CONFIG.pointValue}¢/pt): $${fmtDollars(bestRateInfo.pointsCost)}\n`;
             }
 
             bestRow.title = tooltip;
@@ -1038,11 +1122,13 @@
     // INITIALIZATION
     // ============================================
     function init() {
-        log('StayValue v1.12.0 initializing...');
-        log('Point valuation:', CONFIG.IHG.pointValue, 'cpp');
-        log('Cashback rate:', (CONFIG.IHG.cashbackRate * 100) + '%');
+        log('StayValue v1.15.0 initializing...');
+        log('Point valuation:', USER_CONFIG.pointValue, 'cpp');
+        log('Cashback rate:', (USER_CONFIG.cashbackRate * 100) + '%');
+        log('TA rebate rate:', (USER_CONFIG.travelAgentRebateRate * 100) + '%');
         log('Default elite status:', CONFIG.IHG.defaultEliteStatus);
 
+        setupMenuCommands();
         injectStyles();
         loadUserProfileFromStorage();
         loadCurrencyRatesFromStorage();
