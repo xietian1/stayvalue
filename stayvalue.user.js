@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         StayValue
 // @namespace    https://github.com/chaoxu/stayvalue
-// @version      1.11.0
+// @version      1.12.0
 // @description  Compare hotel point rates vs cash rates - shows cents-per-point (cpp) and highlights better value
 // @match        https://www.ihg.com/*
 // @grant        GM_getValue
@@ -19,13 +19,20 @@
         IHG: {
             pointValue: 0.5,  // Your personal valuation in cents per point
             cashbackRate: 0.05,  // 5% cashback on total price (credit card, portal, etc.)
-            // Points earned per dollar spent on room rate (baseAmount) by elite status
-            pointsPerDollar: {
-                'CLUB': 10,      // Normal member
-                'SILVER': 12,    // Silver Elite
-                'GOLD': 14,      // Gold Elite
-                'PLATINUM': 16,  // Platinum Elite
-                'DIAMOND': 20    // Diamond Elite
+            // Base points per dollar by brand (default 10, some brands earn less)
+            brandBasePoints: {
+                'default': 10,
+                'CDLW': 5,    // Candlewood Suites
+                'STAY': 5     // Staybridge Suites
+            },
+            // Elite bonus rate (multiplier on top of base points)
+            // Formula: points = roomRate * brandBasePoints * (1 + eliteBonusRate)
+            eliteBonusRate: {
+                'CLUB': 0,        // 10x (base only)
+                'SILVER': 0.2,    // 12x
+                'GOLD': 0.4,      // 14x
+                'PLATINUM': 0.6,  // 16x
+                'DIAMOND': 1.0    // 20x (2x base)
             },
             defaultEliteStatus: 'DIAMOND',  // Used if not logged in or status unknown
             // Rate plans that offer bonus points
@@ -624,26 +631,13 @@
         return CONFIG.IHG.defaultEliteStatus;
     }
 
-    // Get points earned per dollar for current elite status
-    function getPointsPerDollar() {
+    // Get points earned per dollar for current elite status and brand
+    // Formula: brandBasePoints * (1 + eliteBonusRate)
+    function getPointsPerDollar(brandCode) {
         const level = getUserEliteLevel();
-        return CONFIG.IHG.pointsPerDollar[level] || CONFIG.IHG.pointsPerDollar['CLUB'];
-    }
-
-    // Calculate net cash cost after cashback
-    // totalUSD: total price including taxes and fees (amountAfterTax)
-    // roomRateUSD: base room rate (baseAmount) - points are earned on this
-    function calculateNetCashCost(totalUSD, roomRateUSD) {
-        const cashback = totalUSD * CONFIG.IHG.cashbackRate;
-        const pointsEarned = roomRateUSD * getPointsPerDollar();
-        const netCost = totalUSD - cashback;
-
-        return {
-            grossCost: totalUSD,
-            cashback: cashback,
-            pointsEarned: pointsEarned,
-            netCost: netCost
-        };
+        const basePoints = CONFIG.IHG.brandBasePoints[brandCode] || CONFIG.IHG.brandBasePoints['default'];
+        const bonusRate = CONFIG.IHG.eliteBonusRate[level] ?? CONFIG.IHG.eliteBonusRate['CLUB'];
+        return basePoints * (1 + bonusRate);
     }
 
     // Calculate effective CPP based on net cash cost and net points
@@ -670,23 +664,6 @@
         if (!points || points <= 0) return null;
         // pointValue is in cents, convert to dollars
         return points * CONFIG.IHG.pointValue / 100;
-    }
-
-    // Calculate net cash cost including value of earned points
-    // This gives the "true" cost after accounting for cashback and point earnings
-    function calculateCashEffectiveCost(totalUSD, roomRateUSD) {
-        const cashback = totalUSD * CONFIG.IHG.cashbackRate;
-        const pointsEarned = roomRateUSD * getPointsPerDollar();
-        const pointsValue = pointsEarned * CONFIG.IHG.pointValue / 100; // value in dollars
-        const effectiveCost = totalUSD - cashback - pointsValue;
-
-        return {
-            grossCost: totalUSD,
-            cashback: cashback,
-            pointsEarned: pointsEarned,
-            pointsValue: pointsValue,
-            effectiveCost: effectiveCost
-        };
     }
 
     // Determine the best rate between cash and points
@@ -737,8 +714,8 @@
     }
 
     // Find the best cash rate among all rate plans
-    // Returns: { rateCode, bonusPoints, totalUSD, roomRateUSD, effectiveCost, effectiveCalc }
-    function findBestCashRate(apiData, convertFn) {
+    // Returns: { rateCode, bonusPoints, totalUSD, roomRateUSD, feesUSD, taxesUSD, effectiveCost, effectiveCalc }
+    function findBestCashRate(apiData, convertFn, brandCode) {
         const candidates = [];
 
         // Always include the lowest cash rate as baseline
@@ -746,14 +723,18 @@
             const cash = apiData.lowestCashOnlyCost;
             const totalUSD = convertFn(cash.amountAfterTax);
             const roomRateUSD = convertFn(cash.baseAmount);
+            const feesUSD = convertFn(cash.excludedFeeSubTotal) || 0;
+            const taxesUSD = convertFn(cash.excludedTaxSubTotal) || 0;
 
             if (totalUSD !== null && roomRateUSD !== null) {
-                const effectiveCalc = calculateCashEffectiveCostWithBonus(totalUSD, roomRateUSD, 0);
+                const effectiveCalc = calculateCashEffectiveCostWithBonus(totalUSD, roomRateUSD, 0, brandCode);
                 candidates.push({
                     rateCode: 'lowest',
                     bonusPoints: 0,
                     totalUSD,
                     roomRateUSD,
+                    feesUSD,
+                    taxesUSD,
                     effectiveCost: effectiveCalc.effectiveCost,
                     effectiveCalc
                 });
@@ -771,14 +752,18 @@
 
                 const totalUSD = convertFn(plan.rateRange.low.amountAfterTax);
                 const roomRateUSD = convertFn(plan.rateRange.low.baseAmount);
+                const feesUSD = convertFn(plan.rateRange.low.excludedFeeSubTotal) || 0;
+                const taxesUSD = convertFn(plan.rateRange.low.excludedTaxSubTotal) || 0;
 
                 if (totalUSD !== null && roomRateUSD !== null) {
-                    const effectiveCalc = calculateCashEffectiveCostWithBonus(totalUSD, roomRateUSD, bonusPoints);
+                    const effectiveCalc = calculateCashEffectiveCostWithBonus(totalUSD, roomRateUSD, bonusPoints, brandCode);
                     candidates.push({
                         rateCode: plan.code,
                         bonusPoints,
                         totalUSD,
                         roomRateUSD,
+                        feesUSD,
+                        taxesUSD,
                         effectiveCost: effectiveCalc.effectiveCost,
                         effectiveCalc
                     });
@@ -794,9 +779,9 @@
     }
 
     // Calculate cash effective cost with bonus points
-    function calculateCashEffectiveCostWithBonus(totalUSD, roomRateUSD, bonusPoints) {
+    function calculateCashEffectiveCostWithBonus(totalUSD, roomRateUSD, bonusPoints, brandCode) {
         const cashback = totalUSD * CONFIG.IHG.cashbackRate;
-        const basePointsEarned = roomRateUSD * getPointsPerDollar();
+        const basePointsEarned = roomRateUSD * getPointsPerDollar(brandCode);
         const totalPointsEarned = basePointsEarned + bonusPoints;
         const pointsValue = totalPointsEarned * CONFIG.IHG.pointValue / 100;
         const effectiveCost = totalUSD - cashback - pointsValue;
@@ -900,6 +885,7 @@
 
             const apiData = cached.apiData;
             const currency = apiData.propertyCurrency;
+            const brandCode = apiData.brandCode;
             const points = apiData.lowestPointsOnlyCost?.points;
 
             // Create a conversion function for this currency
@@ -917,7 +903,7 @@
             }
 
             // Find the best cash rate among all rate plans (including bonus point rates)
-            const bestCashRate = findBestCashRate(apiData, convertFn);
+            const bestCashRate = findBestCashRate(apiData, convertFn, brandCode);
             if (!bestCashRate) {
                 log('No valid cash rate for:', hotelCode);
                 return;
@@ -953,6 +939,7 @@
             const eliteLevel = getUserEliteLevel();
 
             log('Hotel:', hotelCode,
+                '| Brand:', brandCode,
                 '| Type:', points ? 'points+cash' : 'cash-only',
                 '| CPP:', cpp?.toFixed(2) || 'N/A',
                 '| Best rate:', bestRateInfo?.bestRate || 'N/A',
@@ -960,7 +947,8 @@
                 bestCashRate.bonusPoints > 0 ? `(+${bestCashRate.bonusPoints})` : '',
                 '| Cash eff:', bestCashRate.effectiveCost.toFixed(2),
                 '| Points eff:', pointsEffectiveCost?.toFixed(2) || 'N/A',
-                '| Elite:', eliteLevel);
+                '| Elite:', eliteLevel,
+                '| Pts/$:', getPointsPerDollar(brandCode).toFixed(0));
 
             // Inject display
             injectCPPDisplay(card, hotelCode, cpp, {
@@ -1021,18 +1009,25 @@
 
                 // Build tooltip with full breakdown
                 const calc = cashData.cashEffectiveCalc;
+                const best = cashData.bestCashRate;
                 const netCost = (calc.grossCost - calc.cashback).toFixed(0);
                 const grossCost = calc.grossCost.toFixed(0);
+                const roomCost = best.roomRateUSD.toFixed(0);
                 const cashback = calc.cashback.toFixed(0);
                 const totalPointsEarned = calc.totalPointsEarned.toFixed(0);
                 const netPoints = cashData.netPoints.toFixed(0);
                 const redeemPoints = cashData.points.toFixed(0);
 
-                let tooltip = `Best cash rate: ${cashData.bestCashRate.rateCode}`;
+                // Build gross breakdown (only show fees/tax if > 0)
+                let grossBreakdown = `$${roomCost} room`;
+                if (best.feesUSD > 0) grossBreakdown += ` + $${best.feesUSD.toFixed(0)} fees`;
+                if (best.taxesUSD > 0) grossBreakdown += ` + $${best.taxesUSD.toFixed(0)} tax`;
+
+                let tooltip = `Best cash rate: ${best.rateCode}`;
                 if (calc.bonusPoints > 0) {
                     tooltip += ` (+${calc.bonusPoints.toLocaleString()} bonus)`;
                 }
-                tooltip += `\n  Gross: $${grossCost}\n`;
+                tooltip += `\n  Gross: $${grossCost} (${grossBreakdown})\n`;
                 tooltip += `  Cashback (${(CONFIG.IHG.cashbackRate * 100).toFixed(0)}%): -$${cashback}\n`;
                 tooltip += `  Net cost: $${netCost}\n`;
                 tooltip += `  Points earned: ${totalPointsEarned}`;
@@ -1092,13 +1087,19 @@
 
             // Add tooltip explaining the effective costs
             const effCalc = cashData.cashEffectiveCalc;
+
+            // Build gross breakdown (only show fees/tax if > 0)
+            let grossBreakdown = `$${bestCashRate?.roomRateUSD?.toFixed(0) || '?'} room`;
+            if (bestCashRate?.feesUSD > 0) grossBreakdown += ` + $${bestCashRate.feesUSD.toFixed(0)} fees`;
+            if (bestCashRate?.taxesUSD > 0) grossBreakdown += ` + $${bestCashRate.taxesUSD.toFixed(0)} tax`;
+
             let tooltip = `Effective cost comparison:\n\n`;
             tooltip += `Best cash rate: ${bestCashRate?.rateCode || 'lowest'}`;
             if (bonusPoints > 0) {
                 tooltip += ` (+${bonusPoints.toLocaleString()} bonus pts)`;
             }
             tooltip += `\n`;
-            tooltip += `  Gross: $${effCalc.grossCost.toFixed(0)}\n`;
+            tooltip += `  Gross: $${effCalc.grossCost.toFixed(0)} (${grossBreakdown})\n`;
             tooltip += `  Cashback (${(CONFIG.IHG.cashbackRate * 100).toFixed(0)}%): -$${effCalc.cashback.toFixed(0)}\n`;
             if (effCalc.basePointsEarned !== undefined) {
                 tooltip += `  Base points: ${effCalc.basePointsEarned.toFixed(0)}\n`;
@@ -1151,7 +1152,7 @@
     // INITIALIZATION
     // ============================================
     function init() {
-        log('StayValue v1.11.0 initializing...');
+        log('StayValue v1.12.0 initializing...');
         log('Point valuation:', CONFIG.IHG.pointValue, 'cpp');
         log('Cashback rate:', (CONFIG.IHG.cashbackRate * 100) + '%');
         log('Default elite status:', CONFIG.IHG.defaultEliteStatus);
