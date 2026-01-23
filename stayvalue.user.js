@@ -37,6 +37,7 @@
             defaultEliteStatus: 'DIAMOND',  // Used if not logged in or status unknown
             // Rate plans that offer bonus points
             bonusPointsRates: {
+                'IKBIZ': 1000,
                 'IKPCM': 1000,
                 'IKME3': 1000,
                 'IKME4': 1000,
@@ -56,9 +57,6 @@
     // ============================================
     let userProfile = {
         loaded: false,
-        memberNumber: null,
-        firstName: null,
-        lastName: null,
         pointsBalance: null,
         programs: []  // Array of { programCode, levelCode, levelDescription }
     };
@@ -93,23 +91,15 @@
     function parseUserProfileResponse(data) {
         try {
             userProfile.loaded = true;
-            userProfile.memberNumber = data.rewardsClubMemberNumber || null;
-            userProfile.firstName = data.name?.firstName || null;
-            userProfile.lastName = data.name?.lastName || null;
-
-            // Extract programs with their levels
             userProfile.programs = [];
+
             if (data.programs && Array.isArray(data.programs)) {
                 data.programs.forEach(prog => {
-                    const programInfo = {
+                    userProfile.programs.push({
                         programCode: prog.programCode,
                         levelCode: prog.levelCode,
-                        levelDescription: prog.levelDescription,
-                        pointsBalance: prog.currentPointsBalance || null,
-                        enrollmentDate: prog.enrollmentDate || null,
-                        expirationDate: prog.levelExpirationDate || prog.membershipExpirationDate || null
-                    };
-                    userProfile.programs.push(programInfo);
+                        levelDescription: prog.levelDescription
+                    });
 
                     // Get points balance from main PC (Priority Club) program
                     if (prog.programCode === 'PC' && prog.currentPointsBalance) {
@@ -129,24 +119,6 @@
         } catch (e) {
             log('Error parsing user profile:', e);
         }
-    }
-
-    // Helper functions for user profile
-    function getUserEliteStatus() {
-        const pcProgram = userProfile.programs.find(p => p.programCode === 'PC');
-        return pcProgram ? {
-            levelCode: pcProgram.levelCode,
-            levelDescription: pcProgram.levelDescription,
-            pointsBalance: userProfile.pointsBalance
-        } : null;
-    }
-
-    function hasAmbassadorStatus() {
-        return userProfile.programs.some(p => p.programCode === 'AMB');
-    }
-
-    function getPointsBalance() {
-        return userProfile.pointsBalance || 0;
     }
 
     // ============================================
@@ -288,135 +260,50 @@
                 return;
             }
 
-            const searchInfo = {
-                startDate: data.startDate,
-                endDate: data.endDate
-            };
-
-            log('Parsing availability response:', searchInfo, 'with', data.hotels.length, 'hotels');
+            log('Parsing availability response with', data.hotels.length, 'hotels');
 
             data.hotels.forEach(hotel => {
                 const hotelCode = hotel.hotelMnemonic;
                 if (!hotelCode) return;
 
-                // Build API data object with all the detailed rate information
+                // Build API data object with only the fields we need
                 const apiData = {
-                    availabilityStatus: hotel.availabilityStatus,
-                    rewardNightAvailable: hotel.rewardNightAvailable,
                     propertyCurrency: hotel.propertyCurrency,
-                    brandCode: hotel.brandCode,
-                    isoCountryCode: hotel.isoCountryCode,
-                    searchStartDate: searchInfo.startDate,
-                    searchEndDate: searchInfo.endDate
+                    brandCode: hotel.brandCode
                 };
 
-                // Store lowest cash only cost (with breakdown)
+                // Store lowest cash only cost
                 if (hotel.lowestCashOnlyCost) {
                     apiData.lowestCashOnlyCost = {
                         baseAmount: hotel.lowestCashOnlyCost.baseAmount,
                         excludedFeeSubTotal: hotel.lowestCashOnlyCost.excludedFeeSubTotal,
                         excludedTaxSubTotal: hotel.lowestCashOnlyCost.excludedTaxSubTotal,
-                        amountAfterTax: hotel.lowestCashOnlyCost.amountAfterTax,
-                        basePlusExcludedFeesAmount: hotel.lowestCashOnlyCost.basePlusExcludedFeesAmount,
-                        numberOfAvailableProducts: hotel.lowestCashOnlyCost.numberOfAvailableProducts
-                    };
-                }
-
-                // Store highest cash only cost
-                if (hotel.highestCashOnlyCost) {
-                    apiData.highestCashOnlyCost = {
-                        baseAmount: hotel.highestCashOnlyCost.baseAmount,
-                        excludedFeeSubTotal: hotel.highestCashOnlyCost.excludedFeeSubTotal,
-                        excludedTaxSubTotal: hotel.highestCashOnlyCost.excludedTaxSubTotal,
-                        amountAfterTax: hotel.highestCashOnlyCost.amountAfterTax,
-                        basePlusExcludedFeesAmount: hotel.highestCashOnlyCost.basePlusExcludedFeesAmount,
-                        ratePlanType: hotel.highestCashOnlyCost.ratePlanType
+                        amountAfterTax: hotel.lowestCashOnlyCost.amountAfterTax
                     };
                 }
 
                 // Store lowest points only cost
                 if (hotel.lowestPointsOnlyCost) {
                     apiData.lowestPointsOnlyCost = {
-                        points: hotel.lowestPointsOnlyCost.points,
-                        originalPoints: hotel.lowestPointsOnlyCost.originalPoints
+                        points: hotel.lowestPointsOnlyCost.points
                     };
                 }
 
-                // Store highest points only cost
-                if (hotel.highestPointsOnlyCost) {
-                    apiData.highestPointsOnlyCost = {
-                        points: hotel.highestPointsOnlyCost.points,
-                        originalPoints: hotel.highestPointsOnlyCost.originalPoints
-                    };
-                }
-
-                // Store lowest points and cash cost
-                if (hotel.lowestPointsAndCashCost) {
-                    apiData.lowestPointsAndCashCost = {
-                        points: hotel.lowestPointsAndCashCost.points,
-                        cash: hotel.lowestPointsAndCashCost.cash,
-                        originalPoints: hotel.lowestPointsAndCashCost.originalPoints,
-                        originalCash: hotel.lowestPointsAndCashCost.originalCash
-                    };
-                }
-
-                // Store highest points and cash cost
-                if (hotel.highestPointsAndCashCost) {
-                    apiData.highestPointsAndCashCost = {
-                        points: hotel.highestPointsAndCashCost.points,
-                        cash: hotel.highestPointsAndCashCost.cash,
-                        originalPoints: hotel.highestPointsAndCashCost.originalPoints,
-                        originalCash: hotel.highestPointsAndCashCost.originalCash
-                    };
-                }
-
-                // Store rate plan definitions (IKME3, IKME4, etc.)
+                // Store rate plan definitions (for bonus point rates like IKME3, IKM5K, etc.)
                 if (hotel.ratePlanDefinitions && Array.isArray(hotel.ratePlanDefinitions)) {
                     apiData.ratePlanDefinitions = hotel.ratePlanDefinitions
-                        .filter(plan => plan.rateRange || plan.isRewardNight) // Only store plans with actual rate data
-                        .map(plan => {
-                            const planData = {
-                                code: plan.code,
-                                isPreferred: plan.isPreferred,
-                                isAvailable: plan.isAvailable !== false, // default to true if not specified
-                                isRewardNight: plan.isRewardNight || false
-                            };
-
-                            if (plan.providerDescription) {
-                                planData.providerDescription = plan.providerDescription;
-                            }
-                            if (plan.customDisplay) {
-                                planData.customDisplay = plan.customDisplay;
-                            }
-                            if (plan.types) {
-                                planData.types = plan.types;
-                            }
-
-                            // Store rate range if available
-                            if (plan.rateRange) {
-                                planData.rateRange = {};
-                                if (plan.rateRange.low) {
-                                    planData.rateRange.low = {
-                                        baseAmount: plan.rateRange.low.baseAmount,
-                                        excludedFeeSubTotal: plan.rateRange.low.excludedFeeSubTotal,
-                                        excludedTaxSubTotal: plan.rateRange.low.excludedTaxSubTotal,
-                                        amountAfterTax: plan.rateRange.low.amountAfterTax,
-                                        basePlusExcludedFeesAmount: plan.rateRange.low.basePlusExcludedFeesAmount
-                                    };
-                                }
-                                if (plan.rateRange.high) {
-                                    planData.rateRange.high = {
-                                        baseAmount: plan.rateRange.high.baseAmount,
-                                        excludedFeeSubTotal: plan.rateRange.high.excludedFeeSubTotal,
-                                        excludedTaxSubTotal: plan.rateRange.high.excludedTaxSubTotal,
-                                        amountAfterTax: plan.rateRange.high.amountAfterTax,
-                                        basePlusExcludedFeesAmount: plan.rateRange.high.basePlusExcludedFeesAmount
-                                    };
+                        .filter(plan => plan.rateRange?.low) // Only store plans with rate data
+                        .map(plan => ({
+                            code: plan.code,
+                            rateRange: {
+                                low: {
+                                    baseAmount: plan.rateRange.low.baseAmount,
+                                    excludedFeeSubTotal: plan.rateRange.low.excludedFeeSubTotal,
+                                    excludedTaxSubTotal: plan.rateRange.low.excludedTaxSubTotal,
+                                    amountAfterTax: plan.rateRange.low.amountAfterTax
                                 }
                             }
-
-                            return planData;
-                        });
+                        }));
                 }
 
                 // Update cache entry
@@ -425,10 +312,9 @@
                     apiTimestamp: Date.now()
                 });
 
-                log('Stored API data for', hotelCode, '| Currency:', apiData.propertyCurrency,
-                    '| Points:', apiData.lowestPointsOnlyCost?.points,
-                    '| Cash:', apiData.lowestCashOnlyCost?.amountAfterTax,
-                    '| Rate plans:', apiData.ratePlanDefinitions?.length || 0);
+                log('Cached:', hotelCode, '| Brand:', apiData.brandCode,
+                    '| Points:', apiData.lowestPointsOnlyCost?.points || 'N/A',
+                    '| Cash:', apiData.lowestCashOnlyCost?.amountAfterTax || 'N/A');
             });
 
             saveHotelCacheToStorage();
