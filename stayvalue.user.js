@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         StayValue
 // @namespace    https://github.com/chaoxu/stayvalue
-// @version      1.15.0
+// @version      1.16.0
 // @description  Compare hotel point rates vs cash rates - shows cents-per-point (cpp) and highlights better value
 // @match        https://www.ihg.com/*
 // @grant        GM_getValue
@@ -21,7 +21,8 @@
         pointValue: GM_getValue('pointValue', 0.5),           // cents per point valuation
         cashbackRate: GM_getValue('cashbackRate', 0.05),      // % cashback on total price
         travelAgentRebateRate: GM_getValue('travelAgentRebateRate', 0.07),  // % rebate on room rate
-        dollarDecimals: GM_getValue('dollarDecimals', 0)      // decimal places for dollar amounts (0, 1, or 2)
+        dollarDecimals: GM_getValue('dollarDecimals', 0),     // decimal places for dollar amounts (0, 1, or 2)
+        iataCode: GM_getValue('iataCode', '')                 // IATA code for travel agent tracking
     };
 
     const CONFIG = {
@@ -111,6 +112,19 @@
                     alert(`Dollar decimals set to ${num}. Refresh the page to apply.`);
                 } else {
                     alert('Invalid value. Please enter 0, 1, or 2.');
+                }
+            }
+        });
+
+        GM_registerMenuCommand(`Set IATA Code (current: ${USER_CONFIG.iataCode || 'not set'})`, () => {
+            const value = prompt('Enter your IATA code (e.g., 99634986):', USER_CONFIG.iataCode);
+            if (value !== null) {
+                const trimmed = value.trim();
+                if (trimmed.length <= 8) {
+                    GM_setValue('iataCode', trimmed);
+                    alert(`IATA code set to "${trimmed}". Refresh the page to apply.`);
+                } else {
+                    alert('Invalid value. IATA code must be 8 characters or less.');
                 }
             }
         });
@@ -1119,13 +1133,49 @@
     const debouncedProcess = debounce(processHotelCards, 300);
 
     // ============================================
+    // IATA CODE INJECTION
+    // ============================================
+
+    // Fill IATA input field if found on the page
+    function fillIataInput() {
+        if (!USER_CONFIG.iataCode) return;
+
+        const iataInput = document.querySelector('input[name="iata"]');
+        if (iataInput && iataInput.value !== USER_CONFIG.iataCode) {
+            iataInput.value = USER_CONFIG.iataCode;
+            // Trigger input event so Angular picks up the change
+            iataInput.dispatchEvent(new Event('input', { bubbles: true }));
+            iataInput.dispatchEvent(new Event('change', { bubbles: true }));
+            log('Filled IATA input with:', USER_CONFIG.iataCode);
+        }
+    }
+
+    // Observe DOM for IATA input fields appearing
+    function setupIataObserver() {
+        if (!USER_CONFIG.iataCode) return;
+
+        const observer = new MutationObserver(() => {
+            fillIataInput();
+        });
+
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+
+        // Also fill immediately if input exists
+        fillIataInput();
+    }
+
+    // ============================================
     // INITIALIZATION
     // ============================================
     function init() {
-        log('StayValue v1.15.0 initializing...');
+        log('StayValue v1.16.0 initializing...');
         log('Point valuation:', USER_CONFIG.pointValue, 'cpp');
         log('Cashback rate:', (USER_CONFIG.cashbackRate * 100) + '%');
         log('TA rebate rate:', (USER_CONFIG.travelAgentRebateRate * 100) + '%');
+        log('IATA code:', USER_CONFIG.iataCode || 'not set');
         log('Default elite status:', CONFIG.IHG.defaultEliteStatus);
 
         setupMenuCommands();
@@ -1134,6 +1184,7 @@
         loadCurrencyRatesFromStorage();
         loadHotelCacheFromStorage();
         setupNetworkInterception();
+        setupIataObserver();
 
         // Initial processing after a short delay (let Angular render)
         setTimeout(processHotelCards, 1500);
