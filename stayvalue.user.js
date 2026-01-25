@@ -248,7 +248,7 @@
         selectors: {
             hotelCard: '.property-card-container',
             priceContainer: ['div.price-container'],
-            iataInput: null  // TODO: find IATA input selector for Marriott
+            iataInput: 'input#iata[data-testid="iata"]'
         },
 
         // API URL patterns
