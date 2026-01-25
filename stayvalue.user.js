@@ -663,17 +663,20 @@
         };
 
         // Method 3: Intercept JSON.parse (catches responses even with fetch wrappers)
-        const originalJSONParse = JSON.parse;
-        JSON.parse = function(text, reviver) {
-            const data = originalJSONParse.call(this, text, reviver);
+        // Only needed for sites like Marriott where Dynatrace wraps fetch
+        if (activeAdapter.name === 'Marriott') {
+            const originalJSONParse = JSON.parse;
+            JSON.parse = function(text, reviver) {
+                const data = originalJSONParse.call(this, text, reviver);
 
-            // Check for Marriott GraphQL response structure
-            if (data?.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges) {
-                handleApiResponse('availability', data);
-            }
+                // Quick exit: only check objects with 'data' property (GraphQL responses)
+                if (data && typeof data === 'object' && data.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges) {
+                    handleApiResponse('availability', data);
+                }
 
-            return data;
-        };
+                return data;
+            };
+        }
 
         // Method 4: Intercept XHR (fallback)
         const originalXHROpen = XMLHttpRequest.prototype.open;
