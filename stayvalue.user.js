@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         StayValue
 // @namespace    https://github.com/chaoxu/stayvalue
-// @version      2.2.2
+// @version      2.3.0
 // @description  Compare hotel point rates vs cash rates - shows cents-per-point (cpp) and highlights better value
 // @match        https://www.ihg.com/*
 // @match        https://www.marriott.com/*
@@ -1123,29 +1123,38 @@
             }
 
             const bestCashRate = findBestCashRate(hotelData, convertFn);
-            if (!bestCashRate) {
-                log('No valid cash rate for:', hotelCode);
+            const points = hotelData.lowestPoints;
+            const pointsEffectiveCost = points ? calculatePointsEffectiveCost(points) : null;
+
+            // Skip if neither cash nor points rate available
+            if (!bestCashRate && !points) {
+                log('No rates available for:', hotelCode);
                 return;
             }
 
-            const points = hotelData.lowestPoints;
-            const pointsEffectiveCost = points ? calculatePointsEffectiveCost(points) : null;
-            const bestRateInfo = determineBestRate(bestCashRate.effectiveCost, pointsEffectiveCost);
-
-            if (bestRateInfo) {
-                bestRateInfo.bestCashRate = bestCashRate;
-            }
-
+            let bestRateInfo = null;
             let cpp = null;
             let isGood = false;
             let netPoints = null;
 
-            if (points) {
-                const effCalc = bestCashRate.effectiveCalc;
-                const netCashCost = effCalc.grossCost - effCalc.cashback - effCalc.travelAgentRebate;
-                netPoints = points + effCalc.totalPointsEarned;
-                cpp = calculateCPP(netCashCost, points, effCalc.totalPointsEarned);
-                isGood = cpp !== null && cpp >= activeAdapter.chainConfig.pointValue;
+            if (bestCashRate) {
+                // Have both cash and points - full comparison
+                bestRateInfo = determineBestRate(bestCashRate.effectiveCost, pointsEffectiveCost);
+                if (bestRateInfo) {
+                    bestRateInfo.bestCashRate = bestCashRate;
+                }
+
+                if (points) {
+                    const effCalc = bestCashRate.effectiveCalc;
+                    const netCashCost = effCalc.grossCost - effCalc.cashback - effCalc.travelAgentRebate;
+                    netPoints = points + effCalc.totalPointsEarned;
+                    cpp = calculateCPP(netCashCost, points, effCalc.totalPointsEarned);
+                    isGood = cpp !== null && cpp >= activeAdapter.chainConfig.pointValue;
+                }
+            } else if (points) {
+                // Points only (sold out for cash)
+                bestRateInfo = { bestRate: 'points', cashCost: null, pointsCost: pointsEffectiveCost, savings: null, pointsOnly: true };
+                log('Points-only hotel (sold out for cash):', hotelCode);
             }
 
             log('Hotel:', hotelCode,
@@ -1157,7 +1166,7 @@
             injectDisplay(card, hotelCode, cpp, {
                 points,
                 netPoints,
-                cashEffectiveCalc: bestCashRate.effectiveCalc,
+                cashEffectiveCalc: bestCashRate?.effectiveCalc || null,
                 pointsEffectiveCost,
                 bestRateInfo,
                 bestCashRate,
@@ -1239,7 +1248,10 @@
                 const cashCostStr = bestRateInfo.cashCost !== null ? `$${fmtDollars(bestRateInfo.cashCost)}` : 'N/A';
                 const pointsCostStr = bestRateInfo.pointsCost !== null ? `$${fmtDollars(bestRateInfo.pointsCost)}` : 'N/A';
 
-                if (bestRateInfo.bestRate === 'points' && bestRateInfo.pointsCost !== null) {
+                if (bestRateInfo.pointsOnly) {
+                    // Points-only hotel (sold out for cash)
+                    bestRow.innerHTML = `<span class="best">Points ${pointsCostStr}</span> <span class="alt">(cash sold out)</span>`;
+                } else if (bestRateInfo.bestRate === 'points' && bestRateInfo.pointsCost !== null) {
                     bestRow.innerHTML = `<span class="best">Points ${pointsCostStr}</span> <span class="alt">vs Cash${bonusLabel} ${cashCostStr}</span>`;
                     if (bestRateInfo.savings > 0) bestRow.innerHTML += ` <span class="savings">(save $${fmtDollars(bestRateInfo.savings)})</span>`;
                 } else if (bestRateInfo.bestRate === 'cash') {
@@ -1251,28 +1263,38 @@
                     }
                 }
 
+                let tooltip = '';
                 const effCalc = data.cashEffectiveCalc;
-                let grossBreakdown = `$${fmtDollars(bestCashRate?.roomRateUSD)} room`;
-                if (bestCashRate?.feesUSD > 0) grossBreakdown += ` + $${fmtDollars(bestCashRate.feesUSD)} fees`;
-                if (bestCashRate?.taxesUSD > 0) grossBreakdown += ` + $${fmtDollars(bestCashRate.taxesUSD)} tax`;
 
-                let tooltip = `Effective cost comparison:\n\nBest cash rate: ${bestCashRate?.rateCode || 'lowest'}`;
-                if (bonusPoints > 0) tooltip += ` (+${fmtPoints(bonusPoints)} bonus pts)`;
-                tooltip += `\n  Gross: $${fmtDollars(effCalc.grossCost)} (${grossBreakdown})\n`;
-                tooltip += `  Cashback (${fmtPercent(activeAdapter.chainConfig.cashbackRate)}%): -$${fmtDollars(effCalc.cashback)}\n`;
-                if (activeAdapter.chainConfig.travelAgentRebateRate > 0) {
-                    tooltip += `  TA Rebate (${fmtPercent(activeAdapter.chainConfig.travelAgentRebateRate)}%): -$${fmtDollars(effCalc.travelAgentRebate)}\n`;
-                }
-                tooltip += `  Base points: ${fmtPoints(effCalc.basePointsEarned)}\n`;
-                if (bonusPoints > 0) tooltip += `  Bonus points: +${fmtPoints(bonusPoints)}\n`;
-                tooltip += `  Total points: ${fmtPoints(effCalc.totalPointsEarned)}\n`;
-                tooltip += `  Points value (${activeAdapter.chainConfig.pointValue}¢/pt): -$${fmtDollars(effCalc.pointsValue)}\n`;
-                tooltip += `  Effective cost: $${fmtDollars(effCalc.effectiveCost)}\n\n`;
-
-                if (bestRateInfo.pointsCost !== null && data.points) {
+                if (bestRateInfo.pointsOnly) {
+                    // Points-only tooltip
+                    tooltip = `Points-only (cash sold out)\n\n`;
                     tooltip += `Points redemption:\n`;
                     tooltip += `  Points to redeem: ${fmtPoints(data.points)}\n`;
                     tooltip += `  Point value (${activeAdapter.chainConfig.pointValue}¢/pt): $${fmtDollars(bestRateInfo.pointsCost)}\n`;
+                } else if (effCalc) {
+                    let grossBreakdown = `$${fmtDollars(bestCashRate?.roomRateUSD)} room`;
+                    if (bestCashRate?.feesUSD > 0) grossBreakdown += ` + $${fmtDollars(bestCashRate.feesUSD)} fees`;
+                    if (bestCashRate?.taxesUSD > 0) grossBreakdown += ` + $${fmtDollars(bestCashRate.taxesUSD)} tax`;
+
+                    tooltip = `Effective cost comparison:\n\nBest cash rate: ${bestCashRate?.rateCode || 'lowest'}`;
+                    if (bonusPoints > 0) tooltip += ` (+${fmtPoints(bonusPoints)} bonus pts)`;
+                    tooltip += `\n  Gross: $${fmtDollars(effCalc.grossCost)} (${grossBreakdown})\n`;
+                    tooltip += `  Cashback (${fmtPercent(activeAdapter.chainConfig.cashbackRate)}%): -$${fmtDollars(effCalc.cashback)}\n`;
+                    if (activeAdapter.chainConfig.travelAgentRebateRate > 0) {
+                        tooltip += `  TA Rebate (${fmtPercent(activeAdapter.chainConfig.travelAgentRebateRate)}%): -$${fmtDollars(effCalc.travelAgentRebate)}\n`;
+                    }
+                    tooltip += `  Base points: ${fmtPoints(effCalc.basePointsEarned)}\n`;
+                    if (bonusPoints > 0) tooltip += `  Bonus points: +${fmtPoints(bonusPoints)}\n`;
+                    tooltip += `  Total points: ${fmtPoints(effCalc.totalPointsEarned)}\n`;
+                    tooltip += `  Points value (${activeAdapter.chainConfig.pointValue}¢/pt): -$${fmtDollars(effCalc.pointsValue)}\n`;
+                    tooltip += `  Effective cost: $${fmtDollars(effCalc.effectiveCost)}\n\n`;
+
+                    if (bestRateInfo.pointsCost !== null && data.points) {
+                        tooltip += `Points redemption:\n`;
+                        tooltip += `  Points to redeem: ${fmtPoints(data.points)}\n`;
+                        tooltip += `  Point value (${activeAdapter.chainConfig.pointValue}¢/pt): $${fmtDollars(bestRateInfo.pointsCost)}\n`;
+                    }
                 }
 
                 bestRow.title = tooltip;
@@ -1335,7 +1357,7 @@
             return;
         }
 
-        log(`StayValue v2.2.2 early init for ${activeAdapter.name}...`);
+        log(`StayValue v2.3.0 early init for ${activeAdapter.name}...`);
 
         // Set up network interception ASAP to catch early requests
         loadFromStorage();
