@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         StayValue
 // @namespace    https://github.com/chaoxu/stayvalue
-// @version      2.2.0
+// @version      2.2.1
 // @description  Compare hotel point rates vs cash rates - shows cents-per-point (cpp) and highlights better value
 // @match        https://www.ihg.com/*
 // @match        https://www.marriott.com/*
@@ -296,8 +296,9 @@
 
         // Parse availability API response (GraphQL)
         parseAvailabilityResponse(data) {
-            // Navigate to edges array
-            const edges = data?.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges;
+            // Navigate to edges array - supports both searchByGeolocation and searchByLocation
+            const edges = data?.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges ||
+                          data?.data?.search?.lowestAvailableRates?.searchByLocation?.edges;
             if (!edges || !Array.isArray(edges)) {
                 return [];
             }
@@ -678,8 +679,9 @@
                 }
             }
 
-            // Check for Marriott GraphQL response structure
-            if (data?.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges) {
+            // Check for Marriott GraphQL response structure (both geo and location endpoints)
+            if (data?.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges ||
+                data?.data?.search?.lowestAvailableRates?.searchByLocation?.edges) {
                 handleApiResponse('availability', data);
             }
 
@@ -694,7 +696,10 @@
                 const data = originalJSONParse.call(this, text, reviver);
 
                 // Quick exit: only check objects with 'data' property (GraphQL responses)
-                if (data && typeof data === 'object' && data.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges) {
+                // Supports both searchByGeolocation and searchByLocation endpoints
+                if (data && typeof data === 'object' &&
+                    (data.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges ||
+                     data.data?.search?.lowestAvailableRates?.searchByLocation?.edges)) {
                     handleApiResponse('availability', data);
                 }
 
@@ -1321,7 +1326,7 @@
             return;
         }
 
-        log(`StayValue v2.2.0 early init for ${activeAdapter.name}...`);
+        log(`StayValue v2.2.1 early init for ${activeAdapter.name}...`);
 
         // Set up network interception ASAP to catch early requests
         loadFromStorage();
