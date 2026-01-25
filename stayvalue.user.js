@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         StayValue
 // @namespace    https://github.com/chaoxu/stayvalue
-// @version      2.1.0
+// @version      2.2.0
 // @description  Compare hotel point rates vs cash rates - shows cents-per-point (cpp) and highlights better value
 // @match        https://www.ihg.com/*
 // @match        https://www.marriott.com/*
@@ -10,7 +10,9 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
-// @run-at       document-idle
+// @grant        GM_xmlhttpRequest
+// @connect      api.exchangerate-api.com
+// @run-at       document-start
 // ==/UserScript==
 
 (function() {
@@ -45,7 +47,7 @@
     }
 
     const CONFIG = {
-        debug: true
+        debug: false
     };
 
     // ============================================
@@ -213,30 +215,169 @@
         }
     };
 
-    // Placeholder adapters for other chains (to be implemented)
     const MarriottAdapter = {
         name: 'Marriott',
         programName: 'Marriott Bonvoy',
         match: /marriott\.com/,
         chainConfig: null,
-        brandBasePoints: { 'default': 10, 'Element': 5, 'Residence Inn': 5, 'TownePlace Suites': 5 },
-        eliteBonusRates: { 'Member': 0, 'Silver': 0.1, 'Gold': 0.25, 'Platinum': 0.5, 'Titanium': 0.75, 'Ambassador': 0.75 },
+
+        // Points earning: 10 pts/$ for most brands, 5 pts/$ for extended stay, 2.5 for Homes & Villas
+        // Brand codes from API (e.g., XF = Four Points Flex, RI = Residence Inn)
+        brandBasePoints: {
+            'default': 10,
+            // Extended stay brands (5 pts/$)
+            'RI': 5,    // Residence Inn
+            'TS': 5,    // TownePlace Suites
+            'EL': 5,    // Element
+            'EX': 5,    // Executive Apartments
+            // Homes & Villas (2.5 pts/$)
+            'HV': 2.5
+        },
+        eliteBonusRates: {
+            'Member': 0,
+            'Silver': 0.1,
+            'Gold': 0.25,
+            'Platinum': 0.5,
+            'Titanium': 0.75,
+            'Ambassador': 0.75
+        },
         defaultEliteStatus: 'Platinum',
         bonusPointsRates: {},
-        selectors: { hotelCard: null, priceContainer: [], iataInput: null },
-        apiPatterns: { availability: null, profile: null, currency: null },
-        getHotelCodeFromCard(card) { return null; },
-        findPriceContainer(card) { return null; },
+
+        // DOM selectors
+        selectors: {
+            hotelCard: '.property-card-container',
+            priceContainer: ['div.price-container'],
+            iataInput: null  // TODO: find IATA input selector for Marriott
+        },
+
+        // API URL patterns
+        apiPatterns: {
+            availability: 'marriott.com/mi/query/phoenixShopDatedSearchByGeoQuery',
+            profile: null,  // TODO: find profile API
+            currency: null  // TODO: find currency API (or use fixed rates)
+        },
+
+        // Get hotel code from card element
+        getHotelCodeFromCard(card) {
+            // Try to find propertyCode in any link within the card
+            const link = card.querySelector('a[href*="propertyCode="]');
+            if (link) {
+                const match = link.href.match(/propertyCode=([A-Z0-9]+)/i);
+                if (match) return match[1];
+            }
+            // Try data attribute
+            const codeAttr = card.getAttribute('data-property-code') || card.getAttribute('data-marsha-code');
+            if (codeAttr) return codeAttr;
+            return null;
+        },
+
+        // Find price container in card
+        findPriceContainer(card) {
+            for (const selector of this.selectors.priceContainer) {
+                const container = card.querySelector(selector);
+                if (container) return container;
+            }
+            return null;
+        },
+
+
+        // Get points per dollar for brand and elite level
         getPointsPerDollar(brandCode, eliteLevel) {
             const basePoints = this.brandBasePoints[brandCode] || this.brandBasePoints['default'];
             const bonusRate = this.eliteBonusRates[eliteLevel] ?? 0;
             return basePoints * (1 + bonusRate);
         },
-        getBonusPoints(rateCode) { return 0; },
-        parseAvailabilityResponse(data) { return []; },
-        parseProfileResponse(data) { return { eliteLevel: this.defaultEliteStatus, pointsBalance: null }; },
-        parseCurrencyResponse(data) { return null; },
-        getApiType(url) { return null; }
+
+        // Get bonus points for a rate code (Marriott doesn't have the same bonus point system as IHG)
+        getBonusPoints(rateCode) {
+            return 0;
+        },
+
+        // Parse availability API response (GraphQL)
+        parseAvailabilityResponse(data) {
+            // Navigate to edges array
+            const edges = data?.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges;
+            if (!edges || !Array.isArray(edges)) {
+                return [];
+            }
+
+            return edges.map(edge => {
+                const node = edge.node;
+                if (!node?.property?.id) return null;
+
+                const property = node.property;
+                const basicInfo = property.basicInformation || {};
+                const rates = node.rates || [];
+
+                const hotelData = {
+                    hotelCode: property.id,
+                    brandCode: basicInfo.brand?.id || 'default',
+                    brandName: basicInfo.brand?.name || '',
+                    currency: basicInfo.currency || 'USD',
+                    hotelName: basicInfo.name || '',
+                    lowestCash: null,
+                    lowestPoints: null,
+                    lengthOfStay: null,
+                    ratePlans: []
+                };
+
+                // Process rates
+                for (const rate of rates) {
+                    if (rate.status?.code !== 'AvailableForSale') continue;
+
+                    const lengthOfStay = rate.lengthOfStay || 1;
+                    hotelData.lengthOfStay = lengthOfStay;
+
+                    // Points rate
+                    if (rate.rateModes?.pointsPerUnit?.points) {
+                        const totalPoints = rate.rateModes.pointsPerUnit.points;
+                        // Convert to per-night points
+                        hotelData.lowestPoints = Math.round(totalPoints / lengthOfStay);
+                    }
+
+                    // Cash rate (StandardRates)
+                    if (rate.rateCategory?.code === 'StandardRates' && rate.rateModes?.lowestAverageRate) {
+                        const cashRate = rate.rateModes.lowestAverageRate;
+                        hotelData.lowestCash = {
+                            // Per night values
+                            roomRate: cashRate.amount?.amount || 0,
+                            fees: cashRate.fees?.amount || 0,
+                            mandatoryFees: cashRate.mandatoryFees?.amount || 0,
+                            taxes: cashRate.taxes?.amount || 0,
+                            total: cashRate.totalAmount?.amount || 0,
+                            // Also store amountPlusMandatoryFees for reference
+                            amountPlusMandatoryFees: cashRate.amountPlusMandatoryFees?.amount || 0
+                        };
+                    }
+                }
+
+                return hotelData;
+            }).filter(h => h !== null && h.hotelCode);
+        },
+
+        // Parse profile API response
+        parseProfileResponse(data) {
+            // TODO: Implement when we find the profile API
+            return {
+                eliteLevel: this.defaultEliteStatus,
+                pointsBalance: null
+            };
+        },
+
+        // Parse currency conversion response
+        parseCurrencyResponse(data) {
+            // TODO: Implement when we find currency API
+            return null;
+        },
+
+        // Check which API type a URL matches
+        getApiType(url) {
+            if (this.apiPatterns.availability && url.includes(this.apiPatterns.availability)) return 'availability';
+            if (this.apiPatterns.profile && url.includes(this.apiPatterns.profile)) return 'profile';
+            if (this.apiPatterns.currency && url.includes(this.apiPatterns.currency)) return 'currency';
+            return null;
+        }
     };
 
     const HyattAdapter = {
@@ -478,11 +619,12 @@
     function setupNetworkInterception() {
         if (!activeAdapter) return;
 
+        // Method 1: Intercept fetch (works for some sites)
         const originalFetch = window.fetch;
         window.fetch = async function(...args) {
+            const url = args[0]?.url || args[0];
             const response = await originalFetch.apply(this, args);
 
-            const url = args[0]?.url || args[0];
             if (typeof url === 'string') {
                 const apiType = activeAdapter.getApiType(url);
                 if (apiType) {
@@ -491,7 +633,7 @@
                         const data = await clone.json();
                         handleApiResponse(apiType, data);
                     } catch (e) {
-                        log('Error intercepting', apiType, 'response:', e);
+                        // Silently ignore parse errors
                     }
                 }
             }
@@ -499,6 +641,41 @@
             return response;
         };
 
+        // Method 2: Intercept Response.prototype.json
+        const originalJson = Response.prototype.json;
+        Response.prototype.json = async function() {
+            const data = await originalJson.apply(this);
+
+            const url = this.url;
+            if (url) {
+                const apiType = activeAdapter.getApiType(url);
+                if (apiType) {
+                    handleApiResponse(apiType, data);
+                }
+            }
+
+            // Check for Marriott GraphQL response structure
+            if (data?.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges) {
+                handleApiResponse('availability', data);
+            }
+
+            return data;
+        };
+
+        // Method 3: Intercept JSON.parse (catches responses even with fetch wrappers)
+        const originalJSONParse = JSON.parse;
+        JSON.parse = function(text, reviver) {
+            const data = originalJSONParse.call(this, text, reviver);
+
+            // Check for Marriott GraphQL response structure
+            if (data?.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges) {
+                handleApiResponse('availability', data);
+            }
+
+            return data;
+        };
+
+        // Method 4: Intercept XHR (fallback)
         const originalXHROpen = XMLHttpRequest.prototype.open;
         const originalXHRSend = XMLHttpRequest.prototype.send;
 
@@ -519,7 +696,7 @@
                             const data = JSON.parse(self.responseText);
                             handleApiResponse(apiType, data);
                         } catch (e) {
-                            log('Error parsing XHR', apiType, 'response:', e);
+                            log('Error parsing XHR response:', e);
                         }
                     });
                 }
@@ -599,15 +776,88 @@
         return cpp.toFixed(2) + ' cpp';
     }
 
+    // Fallback exchange rates (approximate, used if API fails)
+    const FALLBACK_EXCHANGE_RATES = {
+        'JPY_USD': 0.0067,   // ~150 JPY = 1 USD
+        'EUR_USD': 1.08,
+        'GBP_USD': 1.27,
+        'CAD_USD': 0.74,
+        'AUD_USD': 0.65,
+        'CNY_USD': 0.14,
+        'KRW_USD': 0.00075,  // ~1333 KRW = 1 USD
+        'THB_USD': 0.029,
+        'SGD_USD': 0.74,
+        'HKD_USD': 0.13,
+        'MXN_USD': 0.058,
+        'INR_USD': 0.012
+    };
+
+    // Fetch exchange rates from free API
+    function fetchExchangeRates() {
+        // Check if we have recent rates (less than 6 hours old)
+        const lastFetch = GM_getValue('exchangeRates_timestamp', 0);
+        const SIX_HOURS = 6 * 60 * 60 * 1000;
+        if (Date.now() - lastFetch < SIX_HOURS) {
+            const storedRates = GM_getValue('exchangeRates', null);
+            if (storedRates) {
+                Object.entries(storedRates).forEach(([key, value]) => {
+                    currencyRates.set(key, value);
+                });
+                log('Loaded', Object.keys(storedRates).length, 'exchange rates from cache');
+                return;
+            }
+        }
+
+        log('Fetching exchange rates from API...');
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: 'https://api.exchangerate-api.com/v4/latest/USD',
+            onload: function(response) {
+                try {
+                    const data = JSON.parse(response.responseText);
+                    if (data.rates) {
+                        const ratesToStore = {};
+                        // Convert rates: API gives USD -> X, we need X -> USD
+                        Object.entries(data.rates).forEach(([currency, rate]) => {
+                            if (rate > 0) {
+                                const key = `${currency}_USD`;
+                                const inverseRate = 1 / rate;
+                                currencyRates.set(key, inverseRate);
+                                ratesToStore[key] = inverseRate;
+                            }
+                        });
+                        // Store in GM storage for persistence
+                        GM_setValue('exchangeRates', ratesToStore);
+                        GM_setValue('exchangeRates_timestamp', Date.now());
+                        log('Fetched', Object.keys(ratesToStore).length, 'exchange rates');
+                        // Reprocess hotels with new rates
+                        debouncedProcess();
+                    }
+                } catch (e) {
+                    log('Error parsing exchange rate response:', e);
+                }
+            },
+            onerror: function(error) {
+                log('Error fetching exchange rates:', error);
+            }
+        });
+    }
+
     function convertToUSD(amount, fromCurrency) {
         if (!amount || fromCurrency === 'USD') {
             return parseFloat(amount);
         }
         const key = `${fromCurrency}_USD`;
-        const rate = currencyRates.get(key);
+        let rate = currencyRates.get(key);
         if (!rate) {
-            log('No exchange rate found for', key);
-            return null;
+            // Try fallback rates
+            rate = FALLBACK_EXCHANGE_RATES[key];
+            if (rate) {
+                log('Using fallback exchange rate for', key, '=', rate);
+            } else {
+                log('No exchange rate found for', key);
+                return null;
+            }
         }
         return parseFloat(amount) * rate;
     }
@@ -1037,13 +1287,29 @@
     // ============================================
     // INITIALIZATION
     // ============================================
-    function init() {
+    // Early init - runs at document-start before page scripts
+    function initEarly() {
         if (!activeAdapter) {
             log('No adapter found for this site');
             return;
         }
 
-        log(`StayValue v2.1.0 initializing for ${activeAdapter.name}...`);
+        log(`StayValue v2.2.0 early init for ${activeAdapter.name}...`);
+
+        // Set up network interception ASAP to catch early requests
+        loadFromStorage();
+        setupNetworkInterception();
+
+        // Wait for DOM to be ready for everything else
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initDOM);
+        } else {
+            initDOM();
+        }
+    }
+
+    // DOM init - runs when DOM is ready
+    function initDOM() {
         log('Point valuation:', activeAdapter.chainConfig.pointValue, 'cpp');
         log('Cashback rate:', (activeAdapter.chainConfig.cashbackRate * 100) + '%');
         log('TA rebate rate:', (activeAdapter.chainConfig.travelAgentRebateRate * 100) + '%');
@@ -1052,8 +1318,7 @@
 
         setupMenuCommands();
         injectStyles();
-        loadFromStorage();
-        setupNetworkInterception();
+        fetchExchangeRates();
         setupIataObserver();
 
         setTimeout(processHotelCards, 1500);
@@ -1097,9 +1362,6 @@
         showInfo(`StayValue active (${activeAdapter.name})`);
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
-        init();
-    }
+    // Start early init immediately
+    initEarly();
 })();
