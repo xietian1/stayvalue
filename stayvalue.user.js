@@ -254,8 +254,8 @@
         // API URL patterns
         apiPatterns: {
             availability: 'marriott.com/mi/query/phoenixShopDatedSearchByGeoQuery',
-            profile: null,  // TODO: find profile API
-            currency: null  // TODO: find currency API (or use fixed rates)
+            profile: 'marriott.com/hybrid-presentation/api/v1/getUserDetails',
+            currency: null  // Using global exchange rate API
         },
 
         // Get hotel code from card element
@@ -358,11 +358,35 @@
 
         // Parse profile API response
         parseProfileResponse(data) {
-            // TODO: Implement when we find the profile API
-            return {
+            const profile = {
                 eliteLevel: this.defaultEliteStatus,
-                pointsBalance: null
+                pointsBalance: null,
+                levelDescription: null
             };
+
+            if (data?.status === 'success' && data?.userProfileSummary) {
+                const summary = data.userProfileSummary;
+
+                // Extract elite level (e.g., "Titanium Elite" -> "Titanium")
+                if (summary.level) {
+                    profile.levelDescription = summary.level;
+                    // Remove " Elite" suffix to match our eliteBonusRates keys
+                    const levelKey = summary.level.replace(/\s*Elite$/i, '');
+                    if (this.eliteBonusRates[levelKey] !== undefined) {
+                        profile.eliteLevel = levelKey;
+                    }
+                }
+
+                // Extract points balance (e.g., "19,799" -> 19799)
+                if (summary.currentPoints) {
+                    const points = parseInt(summary.currentPoints.replace(/,/g, ''), 10);
+                    if (!isNaN(points)) {
+                        profile.pointsBalance = points;
+                    }
+                }
+            }
+
+            return profile;
         },
 
         // Parse currency conversion response
