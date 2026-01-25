@@ -247,7 +247,7 @@
         // DOM selectors
         selectors: {
             hotelCard: '.property-card-container',
-            priceContainer: ['div.price-container'],
+            priceContainer: ['div.rate-container', 'div.price-sub-section'],
             iataInput: 'input#iata[data-testid="iata"]'
         },
 
@@ -1233,7 +1233,7 @@
                         bestRow.innerHTML = `<span class="best">Cash${bonusLabel} ${cashCostStr}</span> <span class="alt">vs Points ${pointsCostStr}</span>`;
                         if (bestRateInfo.savings > 0) bestRow.innerHTML += ` <span class="savings">(save $${fmtDollars(bestRateInfo.savings)})</span>`;
                     } else {
-                        bestRow.innerHTML = `<span class="best">Cash${bonusLabel} ${cashCostStr}</span> <span class="alt">(no points rate)</span>`;
+                        bestRow.innerHTML = `<span class="best">Cash${bonusLabel} ${cashCostStr}</span>`;
                     }
                 }
 
