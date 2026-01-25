@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         StayValue
 // @namespace    https://github.com/chaoxu/stayvalue
-// @version      2.2.1
+// @version      2.2.2
 // @description  Compare hotel point rates vs cash rates - shows cents-per-point (cpp) and highlights better value
 // @match        https://www.ihg.com/*
 // @match        https://www.marriott.com/*
@@ -294,6 +294,16 @@
             return 0;
         },
 
+        // Convert Marriott amount object to actual number
+        // API returns integers with decimalPoint indicating where to place decimal
+        // e.g., {amount: 1000, decimalPoint: 2} = 10.00, {amount: 1000, decimalPoint: 0} = 1000
+        parseAmount(amountObj) {
+            if (!amountObj || amountObj.amount === undefined) return 0;
+            const amount = amountObj.amount;
+            const decimalPoint = amountObj.decimalPoint || 0;
+            return amount / Math.pow(10, decimalPoint);
+        },
+
         // Parse availability API response (GraphQL)
         parseAvailabilityResponse(data) {
             // Navigate to edges array - supports both searchByGeolocation and searchByLocation
@@ -341,14 +351,13 @@
                     if (rate.rateCategory?.code === 'StandardRates' && rate.rateModes?.lowestAverageRate) {
                         const cashRate = rate.rateModes.lowestAverageRate;
                         hotelData.lowestCash = {
-                            // Per night values
-                            roomRate: cashRate.amount?.amount || 0,
-                            fees: cashRate.fees?.amount || 0,
-                            mandatoryFees: cashRate.mandatoryFees?.amount || 0,
-                            taxes: cashRate.taxes?.amount || 0,
-                            total: cashRate.totalAmount?.amount || 0,
-                            // Also store amountPlusMandatoryFees for reference
-                            amountPlusMandatoryFees: cashRate.amountPlusMandatoryFees?.amount || 0
+                            // Per night values - parse with decimal point handling
+                            roomRate: this.parseAmount(cashRate.amount),
+                            fees: this.parseAmount(cashRate.fees),
+                            mandatoryFees: this.parseAmount(cashRate.mandatoryFees),
+                            taxes: this.parseAmount(cashRate.taxes),
+                            total: this.parseAmount(cashRate.totalAmount),
+                            amountPlusMandatoryFees: this.parseAmount(cashRate.amountPlusMandatoryFees)
                         };
                     }
                 }
@@ -1326,7 +1335,7 @@
             return;
         }
 
-        log(`StayValue v2.2.1 early init for ${activeAdapter.name}...`);
+        log(`StayValue v2.2.2 early init for ${activeAdapter.name}...`);
 
         // Set up network interception ASAP to catch early requests
         loadFromStorage();
