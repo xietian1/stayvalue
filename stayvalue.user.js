@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         StayValue
 // @namespace    https://github.com/chaoxu/stayvalue
-// @version      2.6.5
+// @version      2.7.0
 // @description  Compare hotel point rates vs cash rates - shows cents-per-point (cpp) and highlights better value
 // @match        https://www.ihg.com/*
 // @match        https://www.marriott.com/*
@@ -56,13 +56,62 @@
     // HOTEL CHAIN ADAPTERS
     // ============================================
 
-    const IHGAdapter = {
+    // Base adapter with shared default implementations
+    const BaseAdapter = {
+        chainConfig: null,
+        defaultEliteStatus: 'Member',
+        bonusPointsRates: {},
+
+        // Default: find price container by iterating selectors
+        findPriceContainer(card) {
+            for (const selector of this.selectors.priceContainer) {
+                const container = card.querySelector(selector);
+                if (container) return container;
+            }
+            return null;
+        },
+
+        // Default: calculate points per dollar based on brand and elite level
+        getPointsPerDollar(brandCode, eliteLevel) {
+            const basePoints = this.brandBasePoints[brandCode] || this.brandBasePoints['default'];
+            const bonusRate = this.eliteBonusRates[eliteLevel] ?? 0;
+            return basePoints * (1 + bonusRate);
+        },
+
+        // Default: no bonus points for rate codes
+        getBonusPoints(rateCode) {
+            return this.bonusPointsRates[rateCode] || 0;
+        },
+
+        // Default: no currency conversion parsing
+        parseCurrencyResponse(data) {
+            return null;
+        },
+
+        // Default: URL-based API type detection
+        getApiType(url) {
+            if (this.apiPatterns.availability && url.includes(this.apiPatterns.availability)) return 'availability';
+            if (this.apiPatterns.profile && url.includes(this.apiPatterns.profile)) return 'profile';
+            if (this.apiPatterns.currency && url.includes(this.apiPatterns.currency)) return 'currency';
+            return null;
+        },
+
+        // Default: no special response handling
+        handleResponse(data, url) {
+            return null;
+        }
+    };
+
+    // Helper to create adapter by extending base
+    function createAdapter(config) {
+        return Object.assign(Object.create(BaseAdapter), config);
+    }
+
+    const IHGAdapter = createAdapter({
         name: 'IHG',
         programName: 'IHG One Rewards',
         match: /ihg\.com/,
-        chainConfig: null, // Will be initialized on load
 
-        // Points earning configuration
         brandBasePoints: {
             'default': 10,
             'CDLW': 5,    // Candlewood Suites
@@ -77,58 +126,33 @@
         },
         defaultEliteStatus: 'DIAMOND',
         bonusPointsRates: {
-            'IKBIZ': 1000,
-            'IKPCM': 1000,
-            'IKME3': 1000,
-            'IKME4': 1000,
-            'IKME6': 2000,
-            'IKME7': 2000,
-            'IKME8': 3000,
-            'IKME9': 3000,
-            'IKM5K': 5000
+            'IKBIZ': 1000, 'IKPCM': 1000, 'IKME3': 1000, 'IKME4': 1000,
+            'IKME6': 2000, 'IKME7': 2000, 'IKME8': 3000, 'IKME9': 3000, 'IKM5K': 5000
         },
 
-        // DOM selectors
         selectors: {
             hotelCard: 'app-hotel-card-list-view',
             priceContainer: ['app-hotel-point', 'app-hotel-cash'],
             iataInput: 'input[name="iata"]'
         },
 
-        // API URL patterns
         apiPatterns: {
             availability: 'apis.ihg.com/availability/v3/hotels/offers',
             profile: 'apis.ihg.com/members/v2/profiles/me',
             currency: 'apis.ihg.com/finance/conversions/v2/currencies'
         },
 
-        // Get hotel code from card element
         getHotelCodeFromCard(card) {
             return card.id || card.getAttribute('data-testid')?.replace('hotel-card-', '');
         },
 
-        // Find price container in card
-        findPriceContainer(card) {
-            for (const selector of this.selectors.priceContainer) {
-                const container = card.querySelector(selector);
-                if (container) return container;
-            }
-            return null;
-        },
-
-        // Get points per dollar for brand and elite level
+        // Override: IHG uses CLUB as default elite bonus
         getPointsPerDollar(brandCode, eliteLevel) {
             const basePoints = this.brandBasePoints[brandCode] || this.brandBasePoints['default'];
             const bonusRate = this.eliteBonusRates[eliteLevel] ?? this.eliteBonusRates['CLUB'];
             return basePoints * (1 + bonusRate);
         },
 
-        // Get bonus points for a rate code
-        getBonusPoints(rateCode) {
-            return this.bonusPointsRates[rateCode] || 0;
-        },
-
-        // Parse availability API response
         parseAvailabilityResponse(data) {
             if (!data?.hotels || !Array.isArray(data.hotels)) {
                 return [];
@@ -192,113 +216,53 @@
             return profile;
         },
 
-        // Parse currency conversion response
+        // IHG has its own currency API
         parseCurrencyResponse(data) {
-            if (!data?.fromCurrency || !data?.toCurrency || !data?.results) {
-                return null;
-            }
-
+            if (!data?.fromCurrency || !data?.toCurrency || !data?.results) return null;
             const pResult = data.results.find(r => r.source === 'P');
             if (!pResult) return null;
-
-            return {
-                from: data.fromCurrency.code,
-                to: data.toCurrency.code,
-                rate: pResult.result
-            };
-        },
-
-        // Check which API type a URL matches
-        getApiType(url) {
-            if (url.includes(this.apiPatterns.availability)) return 'availability';
-            if (url.includes(this.apiPatterns.profile)) return 'profile';
-            if (url.includes(this.apiPatterns.currency)) return 'currency';
-            return null;
+            return { from: data.fromCurrency.code, to: data.toCurrency.code, rate: pResult.result };
         }
-    };
+    });
 
-    const MarriottAdapter = {
+    const MarriottAdapter = createAdapter({
         name: 'Marriott',
         programName: 'Marriott Bonvoy',
         match: /marriott\.com/,
-        chainConfig: null,
 
-        // Points earning: 10 pts/$ for most brands, 5 pts/$ for extended stay, 2.5 for Homes & Villas
-        // Brand codes from API (e.g., XF = Four Points Flex, RI = Residence Inn)
         brandBasePoints: {
             'default': 10,
-            // Extended stay brands (5 pts/$)
-            'RI': 5,    // Residence Inn
-            'TS': 5,    // TownePlace Suites
-            'EL': 5,    // Element
-            'EX': 5,    // Executive Apartments
-            // Homes & Villas (2.5 pts/$)
-            'HV': 2.5
+            'RI': 5, 'TS': 5, 'EL': 5, 'EX': 5,  // Extended stay (5 pts/$)
+            'HV': 2.5  // Homes & Villas
         },
         eliteBonusRates: {
-            'Member': 0,
-            'Silver': 0.1,
-            'Gold': 0.25,
-            'Platinum': 0.5,
-            'Titanium': 0.75,
-            'Ambassador': 0.75
+            'Member': 0, 'Silver': 0.1, 'Gold': 0.25,
+            'Platinum': 0.5, 'Titanium': 0.75, 'Ambassador': 0.75
         },
         defaultEliteStatus: 'Platinum',
-        bonusPointsRates: {},
 
-        // DOM selectors
         selectors: {
             hotelCard: '.property-card-container',
             priceContainer: ['div.rate-container', 'div.price-sub-section'],
             iataInput: 'input#iata[data-testid="iata"]'
         },
 
-        // API URL patterns
         apiPatterns: {
             availability: 'marriott.com/mi/query/phoenixShopDatedSearchByGeoQuery',
             profile: 'marriott.com/hybrid-presentation/api/v1/getUserDetails',
-            currency: null  // Using global exchange rate API
+            currency: null
         },
 
-        // Get hotel code from card element
         getHotelCodeFromCard(card) {
-            // Try to find propertyCode in any link within the card
             const link = card.querySelector('a[href*="propertyCode="]');
             if (link) {
                 const match = link.href.match(/propertyCode=([A-Z0-9]+)/i);
                 if (match) return match[1];
             }
-            // Try data attribute
-            const codeAttr = card.getAttribute('data-property-code') || card.getAttribute('data-marsha-code');
-            if (codeAttr) return codeAttr;
-            return null;
+            return card.getAttribute('data-property-code') || card.getAttribute('data-marsha-code') || null;
         },
 
-        // Find price container in card
-        findPriceContainer(card) {
-            for (const selector of this.selectors.priceContainer) {
-                const container = card.querySelector(selector);
-                if (container) return container;
-            }
-            return null;
-        },
-
-
-        // Get points per dollar for brand and elite level
-        getPointsPerDollar(brandCode, eliteLevel) {
-            const basePoints = this.brandBasePoints[brandCode] || this.brandBasePoints['default'];
-            const bonusRate = this.eliteBonusRates[eliteLevel] ?? 0;
-            return basePoints * (1 + bonusRate);
-        },
-
-        // Get bonus points for a rate code (Marriott doesn't have the same bonus point system as IHG)
-        getBonusPoints(rateCode) {
-            return 0;
-        },
-
-        // Convert Marriott amount object to actual number
-        // API returns integers with decimalPoint indicating where to place decimal
-        // e.g., {amount: 1000, decimalPoint: 2} = 10.00, {amount: 1000, decimalPoint: 0} = 1000
+        // Marriott amount parsing: {amount: 1000, decimalPoint: 2} = 10.00
         parseAmount(amountObj) {
             if (!amountObj || amountObj.amount === undefined) return 0;
             const amount = amountObj.amount;
@@ -399,48 +363,29 @@
             }
 
             return profile;
-        },
-
-        // Parse currency conversion response
-        parseCurrencyResponse(data) {
-            // TODO: Implement when we find currency API
-            return null;
-        },
-
-        // Check which API type a URL matches
-        getApiType(url) {
-            if (this.apiPatterns.availability && url.includes(this.apiPatterns.availability)) return 'availability';
-            if (this.apiPatterns.profile && url.includes(this.apiPatterns.profile)) return 'profile';
-            if (this.apiPatterns.currency && url.includes(this.apiPatterns.currency)) return 'currency';
-            return null;
         }
-    };
+    });
 
-    const HyattAdapter = {
+    const HyattAdapter = createAdapter({
         name: 'Hyatt',
         programName: 'World of Hyatt',
         match: /hyatt\.com/,
-        chainConfig: null,
+
         brandBasePoints: { 'default': 5, 'Hyatt Studios': 2.5 },
         eliteBonusRates: { 'Member': 0, 'Discoverist': 0.1, 'Explorist': 0.2, 'Globalist': 0.3 },
         defaultEliteStatus: 'Globalist',
-        bonusPointsRates: {},
 
-        // DOM selectors for hotel cards
         selectors: {
             hotelCard: '[class*="HotelCard_info_section_rate_content"]',
             priceContainer: ['[class*="HotelCard_rates"]', '.rates'],
             iataInput: 'input[name="travel-agent-id"]'
         },
 
-        // API URL patterns - Hyatt uses Next.js SSR, data intercepted via JSON.parse
-        apiPatterns: {
-            availability: null,  // Data comes from embedded JSON, not API calls
-            profile: null,
-            currency: null
-        },
+        apiPatterns: { availability: null, profile: null, currency: null },
 
-        // Get hotel code from card element (extract from link href)
+        // Room types to check in order of preference
+        roomTypes: ['STANDARD_ROOM', 'CLUB', 'STANDARD_SUITE', 'PREMIUM_SUITE'],
+
         getHotelCodeFromCard(card) {
             const link = card.querySelector('a[href*="/shop/rooms/"]');
             if (link) {
@@ -450,39 +395,44 @@
             return null;
         },
 
-        // Find price container in card for injection
         findPriceContainer(card) {
             for (const selector of this.selectors.priceContainer) {
                 const container = card.querySelector(selector);
                 if (container) return container;
             }
-            return card;
+            return card;  // Fallback to card itself
         },
 
-        getPointsPerDollar(brandCode, eliteLevel) {
-            const basePoints = this.brandBasePoints[brandCode] || this.brandBasePoints['default'];
-            const bonusRate = this.eliteBonusRates[eliteLevel] ?? 0;
-            return basePoints * (1 + bonusRate);
+        getApiType(url) {
+            return null;  // Hyatt uses JSON.parse interception, not URL-based
         },
 
-        getBonusPoints(rateCode) { return 0; },
+        parseProfileResponse(data) {
+            return { eliteLevel: this.defaultEliteStatus, pointsBalance: null };
+        },
 
-        // Parse Hyatt hotelSummaries data from Next.js SSR
+        // Get search parameters from URL
+        getSearchParams() {
+            const url = new URL(location.href);
+            const checkinDate = url.searchParams.get('checkinDate');
+            const checkoutDate = url.searchParams.get('checkoutDate');
+            if (!checkinDate || !checkoutDate) return null;
+
+            const checkin = new Date(checkinDate);
+            const checkout = new Date(checkoutDate);
+            const nights = Math.round((checkout - checkin) / (1000 * 60 * 60 * 24));
+            return { checkinDate, checkoutDate, nights };
+        },
+
         parseAvailabilityResponse(data) {
-            // Hyatt embeds data in Next.js Server Components format
-            // Data structure: { hotelSummaries: [{ spiritCode, hotelDetail, leadingRate }] }
-            if (!data?.hotelSummaries || !Array.isArray(data.hotelSummaries)) {
-                return [];
-            }
+            if (!data?.hotelSummaries || !Array.isArray(data.hotelSummaries)) return [];
 
-            // Get number of nights from URL
-            const searchParams = typeof getHyattSearchParams === 'function' ? getHyattSearchParams() : null;
+            const searchParams = this.getSearchParams();
             const nights = searchParams?.nights || 1;
 
             return data.hotelSummaries.map(hotel => {
                 const detail = hotel.hotelDetail || {};
                 const rate = hotel.leadingRate || {};
-
                 if (!rate.spiritCode) return null;
 
                 const hotelData = {
@@ -493,226 +443,318 @@
                     currency: rate.currencyCode || 'USD',
                     lowestCash: null,
                     lowestPoints: null,
-                    nights: nights,
-                    pointsInfo: null,  // Will be populated by multi-day fetch
+                    nights,
+                    pointsInfo: null,
                     ratePlans: []
                 };
 
-                // Cash rate - keep as per-night values for display
-                // rate.rate and rate.rateAfterTax are per-night values from Hyatt
                 if (rate.rate && rate.status === 'BOOKABLE') {
                     hotelData.lowestCash = {
-                        total: rate.rateAfterTax || rate.rate,  // per night
-                        roomRate: rate.rate,  // per night
+                        total: rate.rateAfterTax || rate.rate,
+                        roomRate: rate.rate,
                         fees: 0,
-                        taxes: (rate.rateAfterTax || rate.rate) - rate.rate  // per night
+                        taxes: (rate.rateAfterTax || rate.rate) - rate.rate
                     };
                 }
 
-                // Points rate - per night
-                // For multi-night, embedded data shows "from" (minimum) rate
-                // Will be updated with accurate avg by fetchHyattMultiDayRates
                 if (rate.points) {
-                    hotelData.lowestPoints = rate.points;  // per night
+                    hotelData.lowestPoints = rate.points;
                 }
 
                 return hotelData;
             }).filter(h => h !== null && h.hotelCode);
         },
 
-        parseProfileResponse(data) {
-            return { eliteLevel: this.defaultEliteStatus, pointsBalance: null };
+        // Calculate points from availability API response
+        calculatePoints(data, checkinDate, nights) {
+            if (!data?.days) return null;
+            const roomsOnDate = data.days[checkinDate];
+            if (!roomsOnDate) return null;
+
+            let lowestResult = null;
+            for (const roomType of this.roomTypes) {
+                if (!roomsOnDate[roomType]) continue;
+
+                const roomData = roomsOnDate[roomType];
+                const pointsArray = Array.isArray(roomData.pointsValue)
+                    ? roomData.pointsValue
+                    : (roomData.pointsValue ? [roomData.pointsValue] : []);
+
+                if (pointsArray.length < nights) continue;
+
+                const totalPoints = pointsArray.slice(0, nights).reduce((sum, p) => sum + p, 0);
+                const avgPerNight = Math.round(totalPoints / nights);
+
+                if (lowestResult === null || avgPerNight < lowestResult.avgPerNight) {
+                    lowestResult = { totalPoints, avgPerNight, roomType };
+                }
+            }
+            return lowestResult;
         },
 
-        parseCurrencyResponse(data) { return null; },
+        // Fetch availability for a specific hotel
+        fetchAvailability(spiritCode, checkinDate, checkoutDate, nights) {
+            return new Promise((resolve) => {
+                const apiUrl = `https://www.hyatt.com/explore-hotels/service/avail/days?spiritCode=${spiritCode}&startDate=${checkinDate}&endDate=${checkoutDate}&numAdults=1&numChildren=0&roomQuantity=1&los=${nights}&isMock=false`;
 
-        getApiType(url) {
-            return null;  // Hyatt uses JSON.parse interception, not URL-based
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: apiUrl,
+                    onload: (response) => {
+                        try {
+                            resolve({ spiritCode, data: JSON.parse(response.responseText), success: true });
+                        } catch (e) {
+                            resolve({ spiritCode, data: null, success: false });
+                        }
+                    },
+                    onerror: () => resolve({ spiritCode, data: null, success: false })
+                });
+            });
+        },
+
+        // Extract data from Next.js RSC embedded scripts
+        extractDataFromScripts(handleApiResponse, hotelCache, debouncedProcess) {
+            log('Attempting to extract Hyatt data from page scripts...');
+            const scripts = document.querySelectorAll('script');
+
+            for (const script of scripts) {
+                const text = script.textContent;
+                if (!text || !text.includes('hotelSummaries')) continue;
+
+                const hotelDataStart = text.indexOf('\\"hotelData\\":{');
+                if (hotelDataStart === -1) continue;
+
+                let braceCount = 0;
+                let startIdx = hotelDataStart + '\\"hotelData\\":'.length;
+                let endIdx = startIdx;
+
+                for (let i = startIdx; i < text.length; i++) {
+                    const char = text[i];
+                    if (char === '\\' && text[i + 1]) { i++; continue; }
+                    if (char === '{') braceCount++;
+                    if (char === '}') {
+                        braceCount--;
+                        if (braceCount === 0) { endIdx = i + 1; break; }
+                    }
+                }
+
+                if (endIdx <= startIdx) continue;
+
+                let jsonStr = text.substring(startIdx, endIdx)
+                    .replace(/\\"/g, '"')
+                    .replace(/\\\\/g, '\\');
+
+                try {
+                    const hotelData = JSON.parse(jsonStr);
+                    if (hotelData.hotelSummaries && Array.isArray(hotelData.hotelSummaries)) {
+                        log('Parsed', hotelData.hotelSummaries.length, 'hotels from Next.js RSC');
+                        handleApiResponse('availability', hotelData);
+
+                        const searchParams = this.getSearchParams();
+                        if (searchParams && searchParams.nights > 1) {
+                            this.fetchMultiDayRates(hotelData.hotelSummaries, hotelCache, debouncedProcess);
+                        }
+                        return;
+                    }
+                } catch (e) {
+                    log('Parse failed:', e.message);
+                }
+            }
+            log('Could not parse hotel data from scripts');
+        },
+
+        // Fetch multi-day rates for all hotels with staggered requests
+        fetchMultiDayRates(hotelSummaries, hotelCache, debouncedProcess) {
+            const searchParams = this.getSearchParams();
+            if (!searchParams || searchParams.nights <= 1) return;
+
+            log('Multi-day search:', searchParams.nights, 'nights. Fetching accurate rates...');
+
+            const hotelsWithPoints = hotelSummaries.filter(h => h.leadingRate?.points != null);
+            log('Hotels with points:', hotelsWithPoints.length, '/', hotelSummaries.length);
+
+            const hotelCodes = hotelsWithPoints
+                .map(h => h.spiritCode || h.hotelDetail?.spiritCode)
+                .filter(Boolean);
+
+            hotelCodes.forEach((spiritCode, index) => {
+                setTimeout(() => {
+                    this.fetchAvailability(
+                        spiritCode,
+                        searchParams.checkinDate,
+                        searchParams.checkoutDate,
+                        searchParams.nights
+                    ).then(result => {
+                        if (!result.success || !result.data) return;
+
+                        const pointsInfo = this.calculatePoints(
+                            result.data,
+                            searchParams.checkinDate,
+                            searchParams.nights
+                        );
+                        const hotelCode = spiritCode.toUpperCase();
+                        const cached = hotelCache.get(hotelCode);
+
+                        if (cached?.data) {
+                            if (pointsInfo) {
+                                cached.data.lowestPoints = pointsInfo.avgPerNight;
+                                cached.data.pointsInfo = pointsInfo;
+                                log('Updated', hotelCode, ':',
+                                    pointsInfo.avgPerNight, 'pts/night,',
+                                    pointsInfo.totalPoints, 'total',
+                                    '(' + pointsInfo.roomType + ')');
+                            } else {
+                                cached.data.lowestPoints = null;
+                                cached.data.pointsInfo = null;
+                                log('Updated', hotelCode, ': no points availability');
+                            }
+                            cached.data.nights = searchParams.nights;
+                            hotelCache.set(hotelCode, cached);
+
+                            const card = document.querySelector(`a[href*="/shop/rooms/${spiritCode}"]`)
+                                ?.closest('[class*="HotelCard_info_section_rate_content"]');
+                            if (card) {
+                                card.removeAttribute('data-stayvalue-processed');
+                                card.querySelector('.stayvalue-display')?.remove();
+                            }
+                            debouncedProcess();
+                        }
+                    });
+                }, index * (200 + Math.random() * 100));
+            });
         }
-    };
+    });
 
-    const HiltonAdapter = {
+    const HiltonAdapter = createAdapter({
         name: 'Hilton',
         programName: 'Hilton Honors',
         match: /hilton\.com/,
-        chainConfig: null,
+
         brandBasePoints: { 'default': 10, 'Home2 Suites': 5, 'Tru': 5, 'LivSmart Studios': 3 },
         eliteBonusRates: { 'Member': 0, 'Silver': 0.2, 'Gold': 0.8, 'Diamond': 1.0 },
         defaultEliteStatus: 'Diamond',
-        bonusPointsRates: {},
 
-        // DOM selectors
         selectors: {
             hotelCard: 'li[data-testid^="hotel-card-"]',
             priceContainer: ['[data-testid="priceInfo"]'],
             iataInput: null
         },
 
-        // API patterns for GraphQL endpoints
         apiPatterns: {
             availability: 'hilton.com/graphql/customer',
             profile: 'operationName=callbackProfile',
             currency: null
         },
 
-        // Get hotel code from card element
         getHotelCodeFromCard(card) {
             const testId = card.getAttribute('data-testid');
             if (testId && testId.startsWith('hotel-card-')) {
                 const code = testId.replace('hotel-card-', '');
-                // Valid hotel codes are uppercase alphanumeric (e.g., TYOHITW)
-                // Filter out non-hotel elements like "hotel-card-image", "hotel-card-content"
-                if (code && /^[A-Z0-9]+$/.test(code)) {
-                    return code;
-                }
+                if (code && /^[A-Z0-9]+$/.test(code)) return code;
             }
             return null;
         },
 
-        // Find price container in card
         findPriceContainer(card) {
             for (const selector of this.selectors.priceContainer) {
                 const container = card.querySelector(selector);
                 if (container) return container;
             }
-            // Fallback: try to find any price-related element
+            // Fallback selectors
             const fallbacks = [
-                '[class*="Price"]',
-                '[class*="price"]',
-                '[class*="rate"]',
-                '[class*="Rate"]',
-                '[data-testid*="price"]',
-                '[data-testid*="rate"]'
+                '[class*="Price"]', '[class*="price"]',
+                '[class*="rate"]', '[class*="Rate"]',
+                '[data-testid*="price"]', '[data-testid*="rate"]'
             ];
             for (const selector of fallbacks) {
                 const container = card.querySelector(selector);
                 if (container) return container;
             }
-            // Last resort: use the card itself
             return card;
         },
-
-        getPointsPerDollar(brandCode, eliteLevel) {
-            const basePoints = this.brandBasePoints[brandCode] || this.brandBasePoints['default'];
-            const bonusRate = this.eliteBonusRates[eliteLevel] ?? 0;
-            return basePoints * (1 + bonusRate);
-        },
-
-        getBonusPoints(rateCode) { return 0; },
 
         // Parse currency amount from formatted string (e.g., "¥53,393" -> 53393)
         parseCurrencyAmount(formatted) {
             if (!formatted) return null;
-            const cleaned = formatted.replace(/[^\d.]/g, '');
-            const num = parseFloat(cleaned);
+            const num = parseFloat(formatted.replace(/[^\d.]/g, ''));
             return isNaN(num) ? null : num;
         },
 
-        // Detect currency from formatted string
         detectCurrency(formatted) {
             if (!formatted) return 'USD';
             if (formatted.includes('¥')) return 'JPY';
             if (formatted.includes('€')) return 'EUR';
             if (formatted.includes('£')) return 'GBP';
-            if (formatted.includes('$')) return 'USD';
             return 'USD';
         },
 
-        // Parse Hilton GraphQL availability responses
-        // Focus on shopMultiPropAvail which has all data (points, cash, taxes)
         parseAvailabilityResponse(data) {
             const hotels = [];
+            if (!data?.data?.shopMultiPropAvail) return hotels;
 
-            // Parse shopMultiPropAvail response - this has everything we need
-            if (data?.data?.shopMultiPropAvail) {
-                for (const hotel of data.data.shopMultiPropAvail) {
-                    if (!hotel.ctyhocn || hotel.summary?.status?.type !== 'AVAILABLE') continue;
+            for (const hotel of data.data.shopMultiPropAvail) {
+                if (!hotel.ctyhocn || hotel.summary?.status?.type !== 'AVAILABLE') continue;
 
-                    const summary = hotel.summary || {};
-                    const lowest = summary.lowest;
-                    const hhonors = summary.hhonors;
+                const summary = hotel.summary || {};
+                const lowest = summary.lowest;
+                const hhonors = summary.hhonors;
+                if (!lowest) continue;
 
-                    if (!lowest) continue;
+                const lengthOfStay = hotel.lengthOfStay || 1;
+                const hotelData = {
+                    hotelCode: hotel.ctyhocn,
+                    brandCode: 'default',
+                    currency: hotel.currencyCode || this.detectCurrency(lowest.rateAmountFmt),
+                    lowestCash: null,
+                    lowestPoints: null,
+                    lengthOfStay,
+                    ratePlans: []
+                };
 
-                    const hotelData = {
-                        hotelCode: hotel.ctyhocn,
-                        brandCode: 'default',
-                        currency: hotel.currencyCode || this.detectCurrency(lowest.rateAmountFmt),
-                        lowestCash: null,
-                        lowestPoints: null,
-                        lengthOfStay: hotel.lengthOfStay || 1,
-                        ratePlans: []
-                    };
+                if (lowest.rateAmountFmt) {
+                    const roomRatePerNight = this.parseCurrencyAmount(lowest.rateAmountFmt);
+                    const totalAllNights = lowest.amountAfterTaxFmt
+                        ? this.parseCurrencyAmount(lowest.amountAfterTaxFmt) : null;
 
-                    // Cash rate - parse from formatted amounts (local currency)
-                    // rateAmountFmt is per night, amountAfterTaxFmt is total for all nights
-                    if (lowest.rateAmountFmt) {
-                        const roomRatePerNight = this.parseCurrencyAmount(lowest.rateAmountFmt);
-                        const totalAllNights = lowest.amountAfterTaxFmt
-                            ? this.parseCurrencyAmount(lowest.amountAfterTaxFmt)
-                            : null;
-                        const lengthOfStay = hotelData.lengthOfStay || 1;
+                    if (roomRatePerNight) {
+                        const totalPerNight = totalAllNights ? totalAllNights / lengthOfStay : roomRatePerNight;
+                        const taxesPerNight = totalPerNight - roomRatePerNight;
 
-                        if (roomRatePerNight) {
-                            // Calculate per-night after-tax amount
-                            const totalPerNight = totalAllNights
-                                ? totalAllNights / lengthOfStay
-                                : roomRatePerNight;
-                            const taxesPerNight = totalPerNight - roomRatePerNight;
-
-                            hotelData.lowestCash = {
-                                total: totalPerNight,  // per night, after tax
-                                roomRate: roomRatePerNight,  // per night, before tax
-                                fees: 0,
-                                taxes: taxesPerNight > 0 ? taxesPerNight : 0
-                            };
-                        }
+                        hotelData.lowestCash = {
+                            total: totalPerNight,
+                            roomRate: roomRatePerNight,
+                            fees: 0,
+                            taxes: taxesPerNight > 0 ? taxesPerNight : 0
+                        };
                     }
-
-                    // Points rate - from hhonors.dailyRmPointsRate
-                    if (hhonors?.dailyRmPointsRate) {
-                        hotelData.lowestPoints = hhonors.dailyRmPointsRate;
-                    }
-
-                    hotels.push(hotelData);
                 }
-            }
 
+                if (hhonors?.dailyRmPointsRate) {
+                    hotelData.lowestPoints = hhonors.dailyRmPointsRate;
+                }
+
+                hotels.push(hotelData);
+            }
             return hotels;
         },
 
-        // Parse profile response for elite status
         parseProfileResponse(data) {
-            const profile = {
-                eliteLevel: this.defaultEliteStatus,
-                pointsBalance: null
-            };
-
-            // Parse callbackProfile response
+            const profile = { eliteLevel: this.defaultEliteStatus, pointsBalance: null };
             const tierCode = data?.data?.callbackProfile?.guest?.hhonors?.summary?.tier;
             if (tierCode) {
-                // Tier codes: M=Member, S=Silver, G=Gold, D=Diamond
                 const tierMap = { 'M': 'Member', 'S': 'Silver', 'G': 'Gold', 'D': 'Diamond' };
                 profile.eliteLevel = tierMap[tierCode] || this.defaultEliteStatus;
             }
-
             return profile;
         },
 
-        parseCurrencyResponse(data) { return null; },
-
-        getApiType(url) {
-            if (url.includes(this.apiPatterns.availability)) {
-                if (url.includes('hotelSummaryOptions') || url.includes('shopMultiPropAvail')) {
-                    return 'availability';
-                }
-                if (url.includes(this.apiPatterns.profile)) {
-                    return 'profile';
-                }
-            }
+        // Hilton uses GraphQL - handle responses directly
+        handleResponse(data) {
+            if (data?.data?.shopMultiPropAvail) return 'availability';
+            if (data?.data?.callbackProfile?.guest?.hhonors) return 'profile';
             return null;
         }
-    };
+    });
 
     // All adapters
     const ADAPTERS = [IHGAdapter, MarriottAdapter, HyattAdapter, HiltonAdapter];
@@ -900,50 +942,76 @@
     // ============================================
     // NETWORK INTERCEPTION
     // ============================================
+
+    // Check if data matches known response patterns
+    function detectResponseType(data) {
+        if (!data || typeof data !== 'object') return null;
+
+        // Marriott GraphQL
+        if (data.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges ||
+            data.data?.search?.lowestAvailableRates?.searchByLocation?.edges) {
+            return 'availability';
+        }
+
+        // Hyatt hotelSummaries
+        if (data.hotelSummaries && Array.isArray(data.hotelSummaries)) {
+            return 'availability';
+        }
+        if (data.searchResults?.hotelSummaries && Array.isArray(data.searchResults.hotelSummaries)) {
+            return 'availability';
+        }
+
+        // Hilton GraphQL (use adapter's handleResponse)
+        if (activeAdapter?.handleResponse) {
+            const type = activeAdapter.handleResponse(data);
+            if (type) return type;
+        }
+
+        return null;
+    }
+
+    // Normalize data for handleApiResponse
+    function normalizeResponseData(data) {
+        // Hyatt: if searchResults contains hotelSummaries, unwrap it
+        if (data.searchResults?.hotelSummaries) {
+            return data.searchResults;
+        }
+        return data;
+    }
+
     function setupNetworkInterception() {
         if (!activeAdapter) return;
 
-        // Method 1: Intercept fetch (works for some sites)
+        // Method 1: Intercept fetch
         const originalFetch = window.fetch;
         window.fetch = async function(...args) {
             const url = args[0]?.url || args[0];
             const response = await originalFetch.apply(this, args);
 
             if (typeof url === 'string') {
-                // Hilton: Check GraphQL responses by parsing response data
-                // GraphQL operation names are in POST body, not URL
-                if (activeAdapter.name === 'Hilton' && url.includes('graphql')) {
+                // For GraphQL endpoints, check response data structure
+                if (url.includes('graphql')) {
                     try {
                         const clone = response.clone();
                         const data = await clone.json();
-
-                        // Only use shopMultiPropAvail (has all data: points, cash, taxes)
-                        if (data.data?.shopMultiPropAvail) {
-                            log('[fetch] Hilton shopMultiPropAvail:', data.data.shopMultiPropAvail.length, 'hotels');
-                            handleApiResponse('availability', data);
+                        const apiType = detectResponseType(data);
+                        if (apiType) {
+                            log('[fetch]', activeAdapter.name, apiType);
+                            handleApiResponse(apiType, normalizeResponseData(data));
                         }
-                        if (data.data?.callbackProfile?.guest?.hhonors) {
-                            log('[fetch] Hilton profile');
-                            handleApiResponse('profile', data);
-                        }
-                    } catch (e) {
-                        // Silently ignore parse errors
-                    }
+                    } catch (e) { /* ignore parse errors */ }
                 } else {
-                    // Other adapters: use URL-based detection
+                    // URL-based detection
                     const apiType = activeAdapter.getApiType(url);
                     if (apiType) {
                         try {
                             const clone = response.clone();
                             const data = await clone.json();
                             handleApiResponse(apiType, data);
-                        } catch (e) {
-                            // Silently ignore parse errors
-                        }
+                        } catch (e) { /* ignore parse errors */ }
                     }
                 }
             }
-
             return response;
         };
 
@@ -951,69 +1019,23 @@
         const originalJson = Response.prototype.json;
         Response.prototype.json = async function() {
             const data = await originalJson.apply(this);
-
-            const url = this.url;
-            if (url) {
-                const apiType = activeAdapter.getApiType(url);
-                if (apiType) {
-                    handleApiResponse(apiType, data);
-                }
+            const apiType = detectResponseType(data) || activeAdapter.getApiType(this.url || '');
+            if (apiType) {
+                handleApiResponse(apiType, normalizeResponseData(data));
             }
-
-            // Check for Marriott GraphQL response structure (both geo and location endpoints)
-            if (data?.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges ||
-                data?.data?.search?.lowestAvailableRates?.searchByLocation?.edges) {
-                handleApiResponse('availability', data);
-            }
-
             return data;
         };
 
-        // Method 3: Intercept JSON.parse (catches responses even with fetch wrappers)
-        // Needed for Marriott (Dynatrace wraps fetch), Hyatt (Next.js SSR), and Hilton (GraphQL)
-        if (activeAdapter.name === 'Marriott' || activeAdapter.name === 'Hyatt' || activeAdapter.name === 'Hilton') {
+        // Method 3: Intercept JSON.parse (needed for wrapped fetch like Dynatrace)
+        if (['Marriott', 'Hyatt', 'Hilton'].includes(activeAdapter.name)) {
             const originalJSONParse = JSON.parse;
             JSON.parse = function(text, reviver) {
                 const data = originalJSONParse.call(this, text, reviver);
-
-                // Marriott: GraphQL responses
-                if (data && typeof data === 'object' &&
-                    (data.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges ||
-                     data.data?.search?.lowestAvailableRates?.searchByLocation?.edges)) {
-                    handleApiResponse('availability', data);
+                const apiType = detectResponseType(data);
+                if (apiType) {
+                    log('[JSON.parse]', activeAdapter.name, apiType);
+                    handleApiResponse(apiType, normalizeResponseData(data));
                 }
-
-                // Hyatt: Next.js SSR data with hotelSummaries (can be at root or nested)
-                if (activeAdapter.name === 'Hyatt' && data && typeof data === 'object') {
-                    // Debug: log any parsed JSON containing hotel-related keywords
-                    if (typeof text === 'string' && text.includes('spiritCode')) {
-                        log('Found spiritCode in JSON.parse, keys:', Object.keys(data).slice(0, 10));
-                    }
-
-                    let hyattData = null;
-                    if (data.hotelSummaries && Array.isArray(data.hotelSummaries)) {
-                        hyattData = data;
-                    } else if (data.searchResults?.hotelSummaries && Array.isArray(data.searchResults.hotelSummaries)) {
-                        hyattData = data.searchResults;
-                    }
-                    if (hyattData) {
-                        log('Intercepted Hyatt hotelSummaries:', hyattData.hotelSummaries.length, 'hotels');
-                        handleApiResponse('availability', hyattData);
-                    }
-                }
-
-                // Hilton: GraphQL responses - only use shopMultiPropAvail (has all data)
-                if (activeAdapter.name === 'Hilton' && data && typeof data === 'object') {
-                    if (data.data?.shopMultiPropAvail) {
-                        log('[JSON.parse] Hilton shopMultiPropAvail:', data.data.shopMultiPropAvail.length, 'hotels');
-                        handleApiResponse('availability', data);
-                    }
-                    if (data.data?.callbackProfile?.guest?.hhonors) {
-                        log('[JSON.parse] Hilton profile');
-                        handleApiResponse('profile', data);
-                    }
-                }
-
                 return data;
             };
         }
@@ -1032,37 +1054,20 @@
             const url = this._stayvalueUrl;
 
             if (url) {
-                // Hilton: Only use shopMultiPropAvail (has all data)
-                if (activeAdapter.name === 'Hilton' && url.includes('graphql')) {
+                const isGraphQL = url.includes('graphql');
+                const urlApiType = activeAdapter.getApiType(url);
+
+                if (isGraphQL || urlApiType) {
                     this.addEventListener('load', function() {
                         try {
                             const data = JSON.parse(self.responseText);
-
-                            if (data.data?.shopMultiPropAvail) {
-                                log('[XHR] Hilton shopMultiPropAvail:', data.data.shopMultiPropAvail.length, 'hotels');
-                                handleApiResponse('availability', data);
+                            const apiType = detectResponseType(data) || urlApiType;
+                            if (apiType) {
+                                log('[XHR]', activeAdapter.name, apiType);
+                                handleApiResponse(apiType, normalizeResponseData(data));
                             }
-                            if (data.data?.callbackProfile?.guest?.hhonors) {
-                                log('[XHR] Hilton profile');
-                                handleApiResponse('profile', data);
-                            }
-                        } catch (e) {
-                            // Silently ignore parse errors
-                        }
+                        } catch (e) { /* ignore parse errors */ }
                     });
-                } else {
-                    // Other adapters: use URL-based detection
-                    const apiType = activeAdapter.getApiType(url);
-                    if (apiType) {
-                        this.addEventListener('load', function() {
-                            try {
-                                const data = JSON.parse(self.responseText);
-                                handleApiResponse(apiType, data);
-                            } catch (e) {
-                                log('Error parsing XHR response:', e);
-                            }
-                        });
-                    }
                 }
             }
             return originalXHRSend.apply(this, args);
@@ -1758,7 +1763,7 @@
             return;
         }
 
-        log(`StayValue v2.6.5 early init for ${activeAdapter.name}...`);
+        log(`StayValue v2.7.0 early init for ${activeAdapter.name}...`);
 
         // Set up network interception ASAP to catch early requests
         loadFromStorage();
@@ -1770,233 +1775,6 @@
         } else {
             initDOM();
         }
-    }
-
-    // Extract Hyatt data from Next.js RSC embedded scripts
-    function extractHyattDataFromScripts() {
-        if (activeAdapter?.name !== 'Hyatt') return;
-
-        log('Attempting to extract Hyatt data from page scripts...');
-
-        // Find script containing hotelSummaries
-        const scripts = document.querySelectorAll('script');
-        for (const script of scripts) {
-            const text = script.textContent;
-            if (!text || !text.includes('hotelSummaries')) continue;
-
-            // The data is escaped JSON inside push([1,"..."])
-            // Find "hotelData": and extract the object
-            // Pattern in escaped form: \"hotelData\":{...}
-
-            const hotelDataStart = text.indexOf('\\"hotelData\\":{');
-            if (hotelDataStart === -1) continue;
-
-            // Find the matching closing brace by counting braces
-            let braceCount = 0;
-            let startIdx = hotelDataStart + '\\"hotelData\\":'.length;
-            let endIdx = startIdx;
-
-            for (let i = startIdx; i < text.length; i++) {
-                const char = text[i];
-                if (char === '\\' && text[i + 1]) {
-                    i++; // Skip escaped char
-                    continue;
-                }
-                if (char === '{') braceCount++;
-                if (char === '}') {
-                    braceCount--;
-                    if (braceCount === 0) {
-                        endIdx = i + 1;
-                        break;
-                    }
-                }
-            }
-
-            if (endIdx <= startIdx) continue;
-
-            let jsonStr = text.substring(startIdx, endIdx);
-
-            // Unescape
-            jsonStr = jsonStr.replace(/\\"/g, '"');
-            jsonStr = jsonStr.replace(/\\\\/g, '\\');
-
-            try {
-                const hotelData = JSON.parse(jsonStr);
-                if (hotelData.hotelSummaries && Array.isArray(hotelData.hotelSummaries)) {
-                    log('Parsed', hotelData.hotelSummaries.length, 'hotels from Next.js RSC');
-                    handleApiResponse('availability', hotelData);
-
-                    // For multi-day searches, fetch accurate rates via API
-                    const searchParams = getHyattSearchParams();
-                    if (searchParams && searchParams.nights > 1) {
-                        fetchHyattMultiDayRates(hotelData.hotelSummaries);
-                    }
-                    return;
-                }
-            } catch (e) {
-                log('Parse failed:', e.message);
-            }
-        }
-
-        log('Could not parse hotel data from scripts');
-    }
-
-    // Get Hyatt search parameters from URL
-    function getHyattSearchParams() {
-        const url = new URL(location.href);
-        const params = url.searchParams;
-
-        // URL format: /search/hotels/Tokyo?checkinDate=2026-01-29&checkoutDate=2026-01-30
-        const checkinDate = params.get('checkinDate');
-        const checkoutDate = params.get('checkoutDate');
-
-        if (!checkinDate || !checkoutDate) return null;
-
-        const checkin = new Date(checkinDate);
-        const checkout = new Date(checkoutDate);
-        const nights = Math.round((checkout - checkin) / (1000 * 60 * 60 * 24));
-
-        return { checkinDate, checkoutDate, nights };
-    }
-
-    // Fetch Hyatt availability for a specific hotel via API
-    function fetchHyattAvailability(spiritCode, checkinDate, checkoutDate, nights) {
-        return new Promise((resolve) => {
-            const apiUrl = `https://www.hyatt.com/explore-hotels/service/avail/days?spiritCode=${spiritCode}&startDate=${checkinDate}&endDate=${checkoutDate}&numAdults=1&numChildren=0&roomQuantity=1&los=${nights}&isMock=false`;
-
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url: apiUrl,
-                onload: function(response) {
-                    try {
-                        const data = JSON.parse(response.responseText);
-                        resolve({ spiritCode, data, success: true });
-                    } catch (e) {
-                        log('Failed to parse Hyatt API response for', spiritCode, ':', e.message);
-                        resolve({ spiritCode, data: null, success: false });
-                    }
-                },
-                onerror: function(error) {
-                    log('Failed to fetch Hyatt availability for', spiritCode, ':', error);
-                    resolve({ spiritCode, data: null, success: false });
-                }
-            });
-        });
-    }
-
-    // Room types to check in order of preference (standard first)
-    const HYATT_ROOM_TYPES = ['STANDARD_ROOM', 'CLUB', 'STANDARD_SUITE', 'PREMIUM_SUITE'];
-
-    // Calculate points from Hyatt availability API response
-    // Checks all room types and returns the lowest available rate
-    // Returns { totalPoints, avgPerNight, roomType } or null if no availability
-    function calculateHyattPoints(data, checkinDate, nights) {
-        if (!data?.days) return null;
-
-        const roomsOnDate = data.days[checkinDate];
-        if (!roomsOnDate) return null;
-
-        let lowestResult = null;
-
-        // Check all room types and find the lowest points rate
-        for (const roomType of HYATT_ROOM_TYPES) {
-            if (!roomsOnDate[roomType]) continue;
-
-            const roomData = roomsOnDate[roomType];
-            const pointsArray = Array.isArray(roomData.pointsValue)
-                ? roomData.pointsValue
-                : (roomData.pointsValue ? [roomData.pointsValue] : []);
-
-            // If any night lacks points for this room type, skip it
-            if (pointsArray.length < nights) continue;
-
-            // Sum points for all nights
-            const totalPoints = pointsArray.slice(0, nights).reduce((sum, p) => sum + p, 0);
-            const avgPerNight = Math.round(totalPoints / nights);
-
-            // Keep track of lowest rate
-            if (lowestResult === null || avgPerNight < lowestResult.avgPerNight) {
-                lowestResult = {
-                    totalPoints,
-                    avgPerNight,
-                    roomType
-                };
-            }
-        }
-
-        return lowestResult;
-    }
-
-    // Fetch multi-day rates for all hotels with staggered requests
-    function fetchHyattMultiDayRates(hotelSummaries) {
-        const searchParams = getHyattSearchParams();
-        if (!searchParams || searchParams.nights <= 1) {
-            log('Single night search, using embedded data');
-            return;
-        }
-
-        log('Multi-day search detected:', searchParams.nights, 'nights. Fetching accurate rates...');
-
-        const staggerDelay = 200;
-
-        // Only fetch for hotels that have points in embedded data
-        const hotelsWithPoints = hotelSummaries.filter(h => {
-            const rate = h.leadingRate;
-            return rate?.points != null;
-        });
-
-        log('Hotels with points in embedded data:', hotelsWithPoints.length, '/', hotelSummaries.length);
-
-        const hotelCodes = hotelsWithPoints.map(h => h.spiritCode || h.hotelDetail?.spiritCode).filter(Boolean);
-
-        hotelCodes.forEach((spiritCode, index) => {
-            setTimeout(() => {
-                fetchHyattAvailability(
-                    spiritCode,
-                    searchParams.checkinDate,
-                    searchParams.checkoutDate,
-                    searchParams.nights
-                ).then(result => {
-                    if (result.success && result.data) {
-                        const pointsInfo = calculateHyattPoints(
-                            result.data,
-                            searchParams.checkinDate,
-                            searchParams.nights
-                        );
-                        const hotelCode = spiritCode.toUpperCase();
-
-                        // Update cached hotel data with accurate multi-day points
-                        const cached = hotelCache.get(hotelCode);
-                        if (cached?.data) {
-                            if (pointsInfo) {
-                                // Store per-night value for display consistency
-                                cached.data.lowestPoints = pointsInfo.avgPerNight;
-                                cached.data.pointsInfo = pointsInfo;
-                                log('Updated', hotelCode, ':',
-                                    pointsInfo.avgPerNight, 'pts/night,',
-                                    pointsInfo.totalPoints, 'total for', searchParams.nights, 'nights',
-                                    '(' + pointsInfo.roomType + ')');
-                            } else {
-                                // No points availability (some night lacks points for all room types)
-                                cached.data.lowestPoints = null;
-                                cached.data.pointsInfo = null;
-                                log('Updated', hotelCode, ': no points availability (checked all room types)');
-                            }
-                            cached.data.nights = searchParams.nights;
-                            hotelCache.set(hotelCode, cached);
-
-                            // Re-process to update display
-                            const card = document.querySelector(`a[href*="/shop/rooms/${spiritCode}"]`)?.closest('[class*="HotelCard_info_section_rate_content"]');
-                            if (card) {
-                                card.removeAttribute('data-stayvalue-processed');
-                                card.querySelector('.stayvalue-display')?.remove();
-                            }
-                            debouncedProcess();
-                        }
-                    }
-                });
-            }, index * (staggerDelay + Math.random() * 100));
-        });
     }
 
     // DOM init - runs when DOM is ready
@@ -2013,8 +1791,8 @@
         setupIataObserver();
 
         // For Hyatt: try to extract data from embedded scripts
-        if (activeAdapter.name === 'Hyatt') {
-            setTimeout(extractHyattDataFromScripts, 500);
+        if (activeAdapter.name === 'Hyatt' && activeAdapter.extractDataFromScripts) {
+            setTimeout(() => activeAdapter.extractDataFromScripts(handleApiResponse, hotelCache, debouncedProcess), 500);
         }
 
         setTimeout(processHotelCards, 1500);
@@ -2041,29 +1819,41 @@
 
         observer.observe(document.body, { childList: true, subtree: true });
 
-        // URL observer
+        // URL change detection using History API
         let lastUrl = location.href;
-        const urlObserver = new MutationObserver(() => {
-            if (location.href !== lastUrl) {
-                lastUrl = location.href;
-                log('URL changed to:', lastUrl);
+        function handleUrlChange() {
+            if (location.href === lastUrl) return;
+            lastUrl = location.href;
+            log('URL changed to:', lastUrl);
 
-                // Clear processed markers and injected displays
-                document.querySelectorAll('[data-stayvalue-processed]').forEach(el => el.removeAttribute('data-stayvalue-processed'));
-                document.querySelectorAll('.stayvalue-display').forEach(el => el.remove());
+            // Clear processed markers and injected displays
+            document.querySelectorAll('[data-stayvalue-processed]').forEach(el => el.removeAttribute('data-stayvalue-processed'));
+            document.querySelectorAll('.stayvalue-display').forEach(el => el.remove());
 
-                // For Hilton: clear hotel cache on URL change to force fresh data
-                // This is needed because SPA navigation may not trigger new API calls if data is cached
-                if (activeAdapter.name === 'Hilton') {
-                    log('Clearing hotel cache for Hilton SPA navigation');
-                    hotelCache.clear();
-                    sessionStorage.removeItem('stayvalue_hotels');
-                }
-
-                setTimeout(processHotelCards, 1500);
+            // For Hilton: clear hotel cache on URL change to force fresh data
+            if (activeAdapter.name === 'Hilton') {
+                log('Clearing hotel cache for Hilton SPA navigation');
+                hotelCache.clear();
+                sessionStorage.removeItem('stayvalue_hotels');
             }
-        });
-        urlObserver.observe(document, { subtree: true, childList: true });
+
+            setTimeout(processHotelCards, 1500);
+        }
+
+        // Listen for history changes (SPA navigation)
+        window.addEventListener('popstate', handleUrlChange);
+
+        // Intercept pushState/replaceState for SPA frameworks
+        const originalPushState = history.pushState;
+        const originalReplaceState = history.replaceState;
+        history.pushState = function(...args) {
+            originalPushState.apply(this, args);
+            handleUrlChange();
+        };
+        history.replaceState = function(...args) {
+            originalReplaceState.apply(this, args);
+            handleUrlChange();
+        };
 
         log('StayValue initialized for', activeAdapter.name);
         showInfo(`StayValue active (${activeAdapter.name})`);
