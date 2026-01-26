@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         StayValue
 // @namespace    https://github.com/chaoxu/stayvalue
-// @version      2.5.3
+// @version      2.6.5
 // @description  Compare hotel point rates vs cash rates - shows cents-per-point (cpp) and highlights better value
 // @match        https://www.ihg.com/*
 // @match        https://www.marriott.com/*
@@ -32,9 +32,9 @@
     // Chain-specific config defaults
     const CHAIN_CONFIG_DEFAULTS = {
         IHG: { pointValue: 0.5, cashbackRate: 0.05, travelAgentRebateRate: 0.07 },
-        Marriott: { pointValue: 0.7, cashbackRate: 0.05, travelAgentRebateRate: 0.07 },
-        Hyatt: { pointValue: 1.7, cashbackRate: 0.05, travelAgentRebateRate: 0.07 },
-        Hilton: { pointValue: 0.5, cashbackRate: 0.05, travelAgentRebateRate: 0.07 }
+        Marriott: { pointValue: 0.7, cashbackRate: 0.05, travelAgentRebateRate: 0.03 },
+        Hyatt: { pointValue: 1.5, cashbackRate: 0.05, travelAgentRebateRate: 0 },
+        Hilton: { pointValue: 0.4, cashbackRate: 0.05, travelAgentRebateRate: 0 }
     };
 
     // Get chain-specific config value
@@ -540,20 +540,178 @@
         eliteBonusRates: { 'Member': 0, 'Silver': 0.2, 'Gold': 0.8, 'Diamond': 1.0 },
         defaultEliteStatus: 'Diamond',
         bonusPointsRates: {},
-        selectors: { hotelCard: null, priceContainer: [], iataInput: null },
-        apiPatterns: { availability: null, profile: null, currency: null },
-        getHotelCodeFromCard(card) { return null; },
-        findPriceContainer(card) { return null; },
+
+        // DOM selectors
+        selectors: {
+            hotelCard: 'li[data-testid^="hotel-card-"]',
+            priceContainer: ['[data-testid="priceInfo"]'],
+            iataInput: null
+        },
+
+        // API patterns for GraphQL endpoints
+        apiPatterns: {
+            availability: 'hilton.com/graphql/customer',
+            profile: 'operationName=callbackProfile',
+            currency: null
+        },
+
+        // Get hotel code from card element
+        getHotelCodeFromCard(card) {
+            const testId = card.getAttribute('data-testid');
+            if (testId && testId.startsWith('hotel-card-')) {
+                const code = testId.replace('hotel-card-', '');
+                // Valid hotel codes are uppercase alphanumeric (e.g., TYOHITW)
+                // Filter out non-hotel elements like "hotel-card-image", "hotel-card-content"
+                if (code && /^[A-Z0-9]+$/.test(code)) {
+                    return code;
+                }
+            }
+            return null;
+        },
+
+        // Find price container in card
+        findPriceContainer(card) {
+            for (const selector of this.selectors.priceContainer) {
+                const container = card.querySelector(selector);
+                if (container) return container;
+            }
+            // Fallback: try to find any price-related element
+            const fallbacks = [
+                '[class*="Price"]',
+                '[class*="price"]',
+                '[class*="rate"]',
+                '[class*="Rate"]',
+                '[data-testid*="price"]',
+                '[data-testid*="rate"]'
+            ];
+            for (const selector of fallbacks) {
+                const container = card.querySelector(selector);
+                if (container) return container;
+            }
+            // Last resort: use the card itself
+            return card;
+        },
+
         getPointsPerDollar(brandCode, eliteLevel) {
             const basePoints = this.brandBasePoints[brandCode] || this.brandBasePoints['default'];
             const bonusRate = this.eliteBonusRates[eliteLevel] ?? 0;
             return basePoints * (1 + bonusRate);
         },
+
         getBonusPoints(rateCode) { return 0; },
-        parseAvailabilityResponse(data) { return []; },
-        parseProfileResponse(data) { return { eliteLevel: this.defaultEliteStatus, pointsBalance: null }; },
+
+        // Parse currency amount from formatted string (e.g., "¥53,393" -> 53393)
+        parseCurrencyAmount(formatted) {
+            if (!formatted) return null;
+            const cleaned = formatted.replace(/[^\d.]/g, '');
+            const num = parseFloat(cleaned);
+            return isNaN(num) ? null : num;
+        },
+
+        // Detect currency from formatted string
+        detectCurrency(formatted) {
+            if (!formatted) return 'USD';
+            if (formatted.includes('¥')) return 'JPY';
+            if (formatted.includes('€')) return 'EUR';
+            if (formatted.includes('£')) return 'GBP';
+            if (formatted.includes('$')) return 'USD';
+            return 'USD';
+        },
+
+        // Parse Hilton GraphQL availability responses
+        // Focus on shopMultiPropAvail which has all data (points, cash, taxes)
+        parseAvailabilityResponse(data) {
+            const hotels = [];
+
+            // Parse shopMultiPropAvail response - this has everything we need
+            if (data?.data?.shopMultiPropAvail) {
+                for (const hotel of data.data.shopMultiPropAvail) {
+                    if (!hotel.ctyhocn || hotel.summary?.status?.type !== 'AVAILABLE') continue;
+
+                    const summary = hotel.summary || {};
+                    const lowest = summary.lowest;
+                    const hhonors = summary.hhonors;
+
+                    if (!lowest) continue;
+
+                    const hotelData = {
+                        hotelCode: hotel.ctyhocn,
+                        brandCode: 'default',
+                        currency: hotel.currencyCode || this.detectCurrency(lowest.rateAmountFmt),
+                        lowestCash: null,
+                        lowestPoints: null,
+                        lengthOfStay: hotel.lengthOfStay || 1,
+                        ratePlans: []
+                    };
+
+                    // Cash rate - parse from formatted amounts (local currency)
+                    // rateAmountFmt is per night, amountAfterTaxFmt is total for all nights
+                    if (lowest.rateAmountFmt) {
+                        const roomRatePerNight = this.parseCurrencyAmount(lowest.rateAmountFmt);
+                        const totalAllNights = lowest.amountAfterTaxFmt
+                            ? this.parseCurrencyAmount(lowest.amountAfterTaxFmt)
+                            : null;
+                        const lengthOfStay = hotelData.lengthOfStay || 1;
+
+                        if (roomRatePerNight) {
+                            // Calculate per-night after-tax amount
+                            const totalPerNight = totalAllNights
+                                ? totalAllNights / lengthOfStay
+                                : roomRatePerNight;
+                            const taxesPerNight = totalPerNight - roomRatePerNight;
+
+                            hotelData.lowestCash = {
+                                total: totalPerNight,  // per night, after tax
+                                roomRate: roomRatePerNight,  // per night, before tax
+                                fees: 0,
+                                taxes: taxesPerNight > 0 ? taxesPerNight : 0
+                            };
+                        }
+                    }
+
+                    // Points rate - from hhonors.dailyRmPointsRate
+                    if (hhonors?.dailyRmPointsRate) {
+                        hotelData.lowestPoints = hhonors.dailyRmPointsRate;
+                    }
+
+                    hotels.push(hotelData);
+                }
+            }
+
+            return hotels;
+        },
+
+        // Parse profile response for elite status
+        parseProfileResponse(data) {
+            const profile = {
+                eliteLevel: this.defaultEliteStatus,
+                pointsBalance: null
+            };
+
+            // Parse callbackProfile response
+            const tierCode = data?.data?.callbackProfile?.guest?.hhonors?.summary?.tier;
+            if (tierCode) {
+                // Tier codes: M=Member, S=Silver, G=Gold, D=Diamond
+                const tierMap = { 'M': 'Member', 'S': 'Silver', 'G': 'Gold', 'D': 'Diamond' };
+                profile.eliteLevel = tierMap[tierCode] || this.defaultEliteStatus;
+            }
+
+            return profile;
+        },
+
         parseCurrencyResponse(data) { return null; },
-        getApiType(url) { return null; }
+
+        getApiType(url) {
+            if (url.includes(this.apiPatterns.availability)) {
+                if (url.includes('hotelSummaryOptions') || url.includes('shopMultiPropAvail')) {
+                    return 'availability';
+                }
+                if (url.includes(this.apiPatterns.profile)) {
+                    return 'profile';
+                }
+            }
+            return null;
+        }
     };
 
     // All adapters
@@ -752,14 +910,36 @@
             const response = await originalFetch.apply(this, args);
 
             if (typeof url === 'string') {
-                const apiType = activeAdapter.getApiType(url);
-                if (apiType) {
+                // Hilton: Check GraphQL responses by parsing response data
+                // GraphQL operation names are in POST body, not URL
+                if (activeAdapter.name === 'Hilton' && url.includes('graphql')) {
                     try {
                         const clone = response.clone();
                         const data = await clone.json();
-                        handleApiResponse(apiType, data);
+
+                        // Only use shopMultiPropAvail (has all data: points, cash, taxes)
+                        if (data.data?.shopMultiPropAvail) {
+                            log('[fetch] Hilton shopMultiPropAvail:', data.data.shopMultiPropAvail.length, 'hotels');
+                            handleApiResponse('availability', data);
+                        }
+                        if (data.data?.callbackProfile?.guest?.hhonors) {
+                            log('[fetch] Hilton profile');
+                            handleApiResponse('profile', data);
+                        }
                     } catch (e) {
                         // Silently ignore parse errors
+                    }
+                } else {
+                    // Other adapters: use URL-based detection
+                    const apiType = activeAdapter.getApiType(url);
+                    if (apiType) {
+                        try {
+                            const clone = response.clone();
+                            const data = await clone.json();
+                            handleApiResponse(apiType, data);
+                        } catch (e) {
+                            // Silently ignore parse errors
+                        }
                     }
                 }
             }
@@ -790,8 +970,8 @@
         };
 
         // Method 3: Intercept JSON.parse (catches responses even with fetch wrappers)
-        // Needed for Marriott (Dynatrace wraps fetch) and Hyatt (Next.js SSR)
-        if (activeAdapter.name === 'Marriott' || activeAdapter.name === 'Hyatt') {
+        // Needed for Marriott (Dynatrace wraps fetch), Hyatt (Next.js SSR), and Hilton (GraphQL)
+        if (activeAdapter.name === 'Marriott' || activeAdapter.name === 'Hyatt' || activeAdapter.name === 'Hilton') {
             const originalJSONParse = JSON.parse;
             JSON.parse = function(text, reviver) {
                 const data = originalJSONParse.call(this, text, reviver);
@@ -822,6 +1002,18 @@
                     }
                 }
 
+                // Hilton: GraphQL responses - only use shopMultiPropAvail (has all data)
+                if (activeAdapter.name === 'Hilton' && data && typeof data === 'object') {
+                    if (data.data?.shopMultiPropAvail) {
+                        log('[JSON.parse] Hilton shopMultiPropAvail:', data.data.shopMultiPropAvail.length, 'hotels');
+                        handleApiResponse('availability', data);
+                    }
+                    if (data.data?.callbackProfile?.guest?.hhonors) {
+                        log('[JSON.parse] Hilton profile');
+                        handleApiResponse('profile', data);
+                    }
+                }
+
                 return data;
             };
         }
@@ -840,16 +1032,37 @@
             const url = this._stayvalueUrl;
 
             if (url) {
-                const apiType = activeAdapter.getApiType(url);
-                if (apiType) {
+                // Hilton: Only use shopMultiPropAvail (has all data)
+                if (activeAdapter.name === 'Hilton' && url.includes('graphql')) {
                     this.addEventListener('load', function() {
                         try {
                             const data = JSON.parse(self.responseText);
-                            handleApiResponse(apiType, data);
+
+                            if (data.data?.shopMultiPropAvail) {
+                                log('[XHR] Hilton shopMultiPropAvail:', data.data.shopMultiPropAvail.length, 'hotels');
+                                handleApiResponse('availability', data);
+                            }
+                            if (data.data?.callbackProfile?.guest?.hhonors) {
+                                log('[XHR] Hilton profile');
+                                handleApiResponse('profile', data);
+                            }
                         } catch (e) {
-                            log('Error parsing XHR response:', e);
+                            // Silently ignore parse errors
                         }
                     });
+                } else {
+                    // Other adapters: use URL-based detection
+                    const apiType = activeAdapter.getApiType(url);
+                    if (apiType) {
+                        this.addEventListener('load', function() {
+                            try {
+                                const data = JSON.parse(self.responseText);
+                                handleApiResponse(apiType, data);
+                            } catch (e) {
+                                log('Error parsing XHR response:', e);
+                            }
+                        });
+                    }
                 }
             }
             return originalXHRSend.apply(this, args);
@@ -864,15 +1077,90 @@
         switch (apiType) {
             case 'availability':
                 const hotels = activeAdapter.parseAvailabilityResponse(data);
+                const updatedHotels = [];
+
                 hotels.forEach(hotel => {
+                    const existing = hotelCache.get(hotel.hotelCode);
+                    let dataChanged = false;
+
+                    // Smart merge: combine data from multiple API calls
+                    if (existing?.data) {
+                        const ex = existing.data;
+
+                        // Points: keep from whichever has them, prefer new if available
+                        if (!hotel.lowestPoints && ex.lowestPoints) {
+                            hotel.lowestPoints = ex.lowestPoints;
+                        } else if (hotel.lowestPoints && !ex.lowestPoints) {
+                            dataChanged = true;  // New points data arrived
+                        }
+
+                        // Brand: keep non-default brand
+                        if (hotel.brandCode === 'default' && ex.brandCode !== 'default') {
+                            hotel.brandCode = ex.brandCode;
+                        }
+
+                        // Hotel name: keep if exists
+                        if (!hotel.hotelName && ex.hotelName) {
+                            hotel.hotelName = ex.hotelName;
+                        }
+
+                        // Cash rates: prefer the one with tax info
+                        if (hotel.lowestCash && ex.lowestCash) {
+                            const newHasTaxes = hotel.lowestCash.taxes > 0;
+                            const exHasTaxes = ex.lowestCash.taxes > 0;
+                            if (exHasTaxes && !newHasTaxes) {
+                                hotel.lowestCash = ex.lowestCash;
+                            } else if (newHasTaxes && !exHasTaxes) {
+                                dataChanged = true;  // New tax data arrived
+                            }
+                        } else if (!hotel.lowestCash && ex.lowestCash) {
+                            hotel.lowestCash = ex.lowestCash;
+                        } else if (hotel.lowestCash && !ex.lowestCash) {
+                            dataChanged = true;  // New cash data arrived
+                        }
+
+                        // Length of stay: keep if exists
+                        if (!hotel.lengthOfStay && ex.lengthOfStay) {
+                            hotel.lengthOfStay = ex.lengthOfStay;
+                        }
+
+                        // Check if data is meaningfully different
+                        if (hotel.lowestPoints !== ex.lowestPoints ||
+                            hotel.lowestCash?.total !== ex.lowestCash?.total) {
+                            dataChanged = true;
+                        }
+                    } else {
+                        dataChanged = true;  // New hotel
+                    }
+
                     hotelCache.set(hotel.hotelCode, {
                         data: hotel,
                         timestamp: Date.now()
                     });
+
+                    if (dataChanged) {
+                        updatedHotels.push(hotel.hotelCode);
+                    }
+
                     log('Cached:', hotel.hotelCode, '| Brand:', hotel.brandCode,
                         '| Points:', hotel.lowestPoints || 'N/A',
-                        '| Cash:', hotel.lowestCash?.total || 'N/A');
+                        '| Cash:', hotel.lowestCash?.total || 'N/A',
+                        '| Taxes:', hotel.lowestCash?.taxes || 0,
+                        dataChanged ? '(updated)' : '');
                 });
+
+                // Clear processed markers for updated hotels so they get re-rendered
+                if (updatedHotels.length > 0) {
+                    log('Refreshing display for', updatedHotels.length, 'hotels with new data');
+                    document.querySelectorAll('[data-stayvalue-processed]').forEach(card => {
+                        const hotelCode = activeAdapter.getHotelCodeFromCard(card);
+                        if (hotelCode && updatedHotels.includes(hotelCode)) {
+                            card.removeAttribute('data-stayvalue-processed');
+                            card.querySelector('.stayvalue-display')?.remove();
+                        }
+                    });
+                }
+
                 saveHotelCacheToStorage();
                 debouncedProcess();
                 break;
@@ -1195,6 +1483,9 @@
 
         log('Processing hotel cards...');
         log('Hotel cache has', hotelCache.size, 'entries');
+        if (hotelCache.size > 0) {
+            log('Cached hotel codes:', Array.from(hotelCache.keys()).slice(0, 10).join(', '));
+        }
 
         const cards = document.querySelectorAll(activeAdapter.selectors.hotelCard);
         log('Found', cards.length, 'hotel cards');
@@ -1467,7 +1758,7 @@
             return;
         }
 
-        log(`StayValue v2.5.3 early init for ${activeAdapter.name}...`);
+        log(`StayValue v2.6.5 early init for ${activeAdapter.name}...`);
 
         // Set up network interception ASAP to catch early requests
         loadFromStorage();
@@ -1756,8 +2047,19 @@
             if (location.href !== lastUrl) {
                 lastUrl = location.href;
                 log('URL changed to:', lastUrl);
+
+                // Clear processed markers and injected displays
                 document.querySelectorAll('[data-stayvalue-processed]').forEach(el => el.removeAttribute('data-stayvalue-processed'));
                 document.querySelectorAll('.stayvalue-display').forEach(el => el.remove());
+
+                // For Hilton: clear hotel cache on URL change to force fresh data
+                // This is needed because SPA navigation may not trigger new API calls if data is cached
+                if (activeAdapter.name === 'Hilton') {
+                    log('Clearing hotel cache for Hilton SPA navigation');
+                    hotelCache.clear();
+                    sessionStorage.removeItem('stayvalue_hotels');
+                }
+
                 setTimeout(processHotelCards, 1500);
             }
         });
