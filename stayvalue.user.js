@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         StayValue
 // @namespace    https://github.com/chaoxu/stayvalue
-// @version      2.3.0
+// @version      2.5.3
 // @description  Compare hotel point rates vs cash rates - shows cents-per-point (cpp) and highlights better value
 // @match        https://www.ihg.com/*
 // @match        https://www.marriott.com/*
@@ -12,6 +12,8 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
 // @connect      api.exchangerate-api.com
+// @connect      www.hyatt.com
+// @require      https://update.greasyfork.org/scripts/515994/1478507/gh_2215_make_GM_xhr_more_parallel_again.js
 // @run-at       document-start
 // ==/UserScript==
 
@@ -423,20 +425,110 @@
         eliteBonusRates: { 'Member': 0, 'Discoverist': 0.1, 'Explorist': 0.2, 'Globalist': 0.3 },
         defaultEliteStatus: 'Globalist',
         bonusPointsRates: {},
-        selectors: { hotelCard: null, priceContainer: [], iataInput: null },
-        apiPatterns: { availability: null, profile: null, currency: null },
-        getHotelCodeFromCard(card) { return null; },
-        findPriceContainer(card) { return null; },
+
+        // DOM selectors for hotel cards
+        selectors: {
+            hotelCard: '[class*="HotelCard_info_section_rate_content"]',
+            priceContainer: ['[class*="HotelCard_rates"]', '.rates'],
+            iataInput: 'input[name="travel-agent-id"]'
+        },
+
+        // API URL patterns - Hyatt uses Next.js SSR, data intercepted via JSON.parse
+        apiPatterns: {
+            availability: null,  // Data comes from embedded JSON, not API calls
+            profile: null,
+            currency: null
+        },
+
+        // Get hotel code from card element (extract from link href)
+        getHotelCodeFromCard(card) {
+            const link = card.querySelector('a[href*="/shop/rooms/"]');
+            if (link) {
+                const match = link.href.match(/\/shop\/rooms\/([a-z0-9]+)/i);
+                if (match) return match[1].toUpperCase();
+            }
+            return null;
+        },
+
+        // Find price container in card for injection
+        findPriceContainer(card) {
+            for (const selector of this.selectors.priceContainer) {
+                const container = card.querySelector(selector);
+                if (container) return container;
+            }
+            return card;
+        },
+
         getPointsPerDollar(brandCode, eliteLevel) {
             const basePoints = this.brandBasePoints[brandCode] || this.brandBasePoints['default'];
             const bonusRate = this.eliteBonusRates[eliteLevel] ?? 0;
             return basePoints * (1 + bonusRate);
         },
+
         getBonusPoints(rateCode) { return 0; },
-        parseAvailabilityResponse(data) { return []; },
-        parseProfileResponse(data) { return { eliteLevel: this.defaultEliteStatus, pointsBalance: null }; },
+
+        // Parse Hyatt hotelSummaries data from Next.js SSR
+        parseAvailabilityResponse(data) {
+            // Hyatt embeds data in Next.js Server Components format
+            // Data structure: { hotelSummaries: [{ spiritCode, hotelDetail, leadingRate }] }
+            if (!data?.hotelSummaries || !Array.isArray(data.hotelSummaries)) {
+                return [];
+            }
+
+            // Get number of nights from URL
+            const searchParams = typeof getHyattSearchParams === 'function' ? getHyattSearchParams() : null;
+            const nights = searchParams?.nights || 1;
+
+            return data.hotelSummaries.map(hotel => {
+                const detail = hotel.hotelDetail || {};
+                const rate = hotel.leadingRate || {};
+
+                if (!rate.spiritCode) return null;
+
+                const hotelData = {
+                    hotelCode: rate.spiritCode.toUpperCase(),
+                    brandCode: detail.brand || 'default',
+                    brandName: detail.brandLabel || '',
+                    hotelName: detail.name || '',
+                    currency: rate.currencyCode || 'USD',
+                    lowestCash: null,
+                    lowestPoints: null,
+                    nights: nights,
+                    pointsInfo: null,  // Will be populated by multi-day fetch
+                    ratePlans: []
+                };
+
+                // Cash rate - keep as per-night values for display
+                // rate.rate and rate.rateAfterTax are per-night values from Hyatt
+                if (rate.rate && rate.status === 'BOOKABLE') {
+                    hotelData.lowestCash = {
+                        total: rate.rateAfterTax || rate.rate,  // per night
+                        roomRate: rate.rate,  // per night
+                        fees: 0,
+                        taxes: (rate.rateAfterTax || rate.rate) - rate.rate  // per night
+                    };
+                }
+
+                // Points rate - per night
+                // For multi-night, embedded data shows "from" (minimum) rate
+                // Will be updated with accurate avg by fetchHyattMultiDayRates
+                if (rate.points) {
+                    hotelData.lowestPoints = rate.points;  // per night
+                }
+
+                return hotelData;
+            }).filter(h => h !== null && h.hotelCode);
+        },
+
+        parseProfileResponse(data) {
+            return { eliteLevel: this.defaultEliteStatus, pointsBalance: null };
+        },
+
         parseCurrencyResponse(data) { return null; },
-        getApiType(url) { return null; }
+
+        getApiType(url) {
+            return null;  // Hyatt uses JSON.parse interception, not URL-based
+        }
     };
 
     const HiltonAdapter = {
@@ -698,18 +790,36 @@
         };
 
         // Method 3: Intercept JSON.parse (catches responses even with fetch wrappers)
-        // Only needed for sites like Marriott where Dynatrace wraps fetch
-        if (activeAdapter.name === 'Marriott') {
+        // Needed for Marriott (Dynatrace wraps fetch) and Hyatt (Next.js SSR)
+        if (activeAdapter.name === 'Marriott' || activeAdapter.name === 'Hyatt') {
             const originalJSONParse = JSON.parse;
             JSON.parse = function(text, reviver) {
                 const data = originalJSONParse.call(this, text, reviver);
 
-                // Quick exit: only check objects with 'data' property (GraphQL responses)
-                // Supports both searchByGeolocation and searchByLocation endpoints
+                // Marriott: GraphQL responses
                 if (data && typeof data === 'object' &&
                     (data.data?.search?.lowestAvailableRates?.searchByGeolocation?.edges ||
                      data.data?.search?.lowestAvailableRates?.searchByLocation?.edges)) {
                     handleApiResponse('availability', data);
+                }
+
+                // Hyatt: Next.js SSR data with hotelSummaries (can be at root or nested)
+                if (activeAdapter.name === 'Hyatt' && data && typeof data === 'object') {
+                    // Debug: log any parsed JSON containing hotel-related keywords
+                    if (typeof text === 'string' && text.includes('spiritCode')) {
+                        log('Found spiritCode in JSON.parse, keys:', Object.keys(data).slice(0, 10));
+                    }
+
+                    let hyattData = null;
+                    if (data.hotelSummaries && Array.isArray(data.hotelSummaries)) {
+                        hyattData = data;
+                    } else if (data.searchResults?.hotelSummaries && Array.isArray(data.searchResults.hotelSummaries)) {
+                        hyattData = data.searchResults;
+                    }
+                    if (hyattData) {
+                        log('Intercepted Hyatt hotelSummaries:', hyattData.hotelSummaries.length, 'hotels');
+                        handleApiResponse('availability', hyattData);
+                    }
                 }
 
                 return data;
@@ -1357,7 +1467,7 @@
             return;
         }
 
-        log(`StayValue v2.3.0 early init for ${activeAdapter.name}...`);
+        log(`StayValue v2.5.3 early init for ${activeAdapter.name}...`);
 
         // Set up network interception ASAP to catch early requests
         loadFromStorage();
@@ -1369,6 +1479,233 @@
         } else {
             initDOM();
         }
+    }
+
+    // Extract Hyatt data from Next.js RSC embedded scripts
+    function extractHyattDataFromScripts() {
+        if (activeAdapter?.name !== 'Hyatt') return;
+
+        log('Attempting to extract Hyatt data from page scripts...');
+
+        // Find script containing hotelSummaries
+        const scripts = document.querySelectorAll('script');
+        for (const script of scripts) {
+            const text = script.textContent;
+            if (!text || !text.includes('hotelSummaries')) continue;
+
+            // The data is escaped JSON inside push([1,"..."])
+            // Find "hotelData": and extract the object
+            // Pattern in escaped form: \"hotelData\":{...}
+
+            const hotelDataStart = text.indexOf('\\"hotelData\\":{');
+            if (hotelDataStart === -1) continue;
+
+            // Find the matching closing brace by counting braces
+            let braceCount = 0;
+            let startIdx = hotelDataStart + '\\"hotelData\\":'.length;
+            let endIdx = startIdx;
+
+            for (let i = startIdx; i < text.length; i++) {
+                const char = text[i];
+                if (char === '\\' && text[i + 1]) {
+                    i++; // Skip escaped char
+                    continue;
+                }
+                if (char === '{') braceCount++;
+                if (char === '}') {
+                    braceCount--;
+                    if (braceCount === 0) {
+                        endIdx = i + 1;
+                        break;
+                    }
+                }
+            }
+
+            if (endIdx <= startIdx) continue;
+
+            let jsonStr = text.substring(startIdx, endIdx);
+
+            // Unescape
+            jsonStr = jsonStr.replace(/\\"/g, '"');
+            jsonStr = jsonStr.replace(/\\\\/g, '\\');
+
+            try {
+                const hotelData = JSON.parse(jsonStr);
+                if (hotelData.hotelSummaries && Array.isArray(hotelData.hotelSummaries)) {
+                    log('Parsed', hotelData.hotelSummaries.length, 'hotels from Next.js RSC');
+                    handleApiResponse('availability', hotelData);
+
+                    // For multi-day searches, fetch accurate rates via API
+                    const searchParams = getHyattSearchParams();
+                    if (searchParams && searchParams.nights > 1) {
+                        fetchHyattMultiDayRates(hotelData.hotelSummaries);
+                    }
+                    return;
+                }
+            } catch (e) {
+                log('Parse failed:', e.message);
+            }
+        }
+
+        log('Could not parse hotel data from scripts');
+    }
+
+    // Get Hyatt search parameters from URL
+    function getHyattSearchParams() {
+        const url = new URL(location.href);
+        const params = url.searchParams;
+
+        // URL format: /search/hotels/Tokyo?checkinDate=2026-01-29&checkoutDate=2026-01-30
+        const checkinDate = params.get('checkinDate');
+        const checkoutDate = params.get('checkoutDate');
+
+        if (!checkinDate || !checkoutDate) return null;
+
+        const checkin = new Date(checkinDate);
+        const checkout = new Date(checkoutDate);
+        const nights = Math.round((checkout - checkin) / (1000 * 60 * 60 * 24));
+
+        return { checkinDate, checkoutDate, nights };
+    }
+
+    // Fetch Hyatt availability for a specific hotel via API
+    function fetchHyattAvailability(spiritCode, checkinDate, checkoutDate, nights) {
+        return new Promise((resolve) => {
+            const apiUrl = `https://www.hyatt.com/explore-hotels/service/avail/days?spiritCode=${spiritCode}&startDate=${checkinDate}&endDate=${checkoutDate}&numAdults=1&numChildren=0&roomQuantity=1&los=${nights}&isMock=false`;
+
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: apiUrl,
+                onload: function(response) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        resolve({ spiritCode, data, success: true });
+                    } catch (e) {
+                        log('Failed to parse Hyatt API response for', spiritCode, ':', e.message);
+                        resolve({ spiritCode, data: null, success: false });
+                    }
+                },
+                onerror: function(error) {
+                    log('Failed to fetch Hyatt availability for', spiritCode, ':', error);
+                    resolve({ spiritCode, data: null, success: false });
+                }
+            });
+        });
+    }
+
+    // Room types to check in order of preference (standard first)
+    const HYATT_ROOM_TYPES = ['STANDARD_ROOM', 'CLUB', 'STANDARD_SUITE', 'PREMIUM_SUITE'];
+
+    // Calculate points from Hyatt availability API response
+    // Checks all room types and returns the lowest available rate
+    // Returns { totalPoints, avgPerNight, roomType } or null if no availability
+    function calculateHyattPoints(data, checkinDate, nights) {
+        if (!data?.days) return null;
+
+        const roomsOnDate = data.days[checkinDate];
+        if (!roomsOnDate) return null;
+
+        let lowestResult = null;
+
+        // Check all room types and find the lowest points rate
+        for (const roomType of HYATT_ROOM_TYPES) {
+            if (!roomsOnDate[roomType]) continue;
+
+            const roomData = roomsOnDate[roomType];
+            const pointsArray = Array.isArray(roomData.pointsValue)
+                ? roomData.pointsValue
+                : (roomData.pointsValue ? [roomData.pointsValue] : []);
+
+            // If any night lacks points for this room type, skip it
+            if (pointsArray.length < nights) continue;
+
+            // Sum points for all nights
+            const totalPoints = pointsArray.slice(0, nights).reduce((sum, p) => sum + p, 0);
+            const avgPerNight = Math.round(totalPoints / nights);
+
+            // Keep track of lowest rate
+            if (lowestResult === null || avgPerNight < lowestResult.avgPerNight) {
+                lowestResult = {
+                    totalPoints,
+                    avgPerNight,
+                    roomType
+                };
+            }
+        }
+
+        return lowestResult;
+    }
+
+    // Fetch multi-day rates for all hotels with staggered requests
+    function fetchHyattMultiDayRates(hotelSummaries) {
+        const searchParams = getHyattSearchParams();
+        if (!searchParams || searchParams.nights <= 1) {
+            log('Single night search, using embedded data');
+            return;
+        }
+
+        log('Multi-day search detected:', searchParams.nights, 'nights. Fetching accurate rates...');
+
+        const staggerDelay = 200;
+
+        // Only fetch for hotels that have points in embedded data
+        const hotelsWithPoints = hotelSummaries.filter(h => {
+            const rate = h.leadingRate;
+            return rate?.points != null;
+        });
+
+        log('Hotels with points in embedded data:', hotelsWithPoints.length, '/', hotelSummaries.length);
+
+        const hotelCodes = hotelsWithPoints.map(h => h.spiritCode || h.hotelDetail?.spiritCode).filter(Boolean);
+
+        hotelCodes.forEach((spiritCode, index) => {
+            setTimeout(() => {
+                fetchHyattAvailability(
+                    spiritCode,
+                    searchParams.checkinDate,
+                    searchParams.checkoutDate,
+                    searchParams.nights
+                ).then(result => {
+                    if (result.success && result.data) {
+                        const pointsInfo = calculateHyattPoints(
+                            result.data,
+                            searchParams.checkinDate,
+                            searchParams.nights
+                        );
+                        const hotelCode = spiritCode.toUpperCase();
+
+                        // Update cached hotel data with accurate multi-day points
+                        const cached = hotelCache.get(hotelCode);
+                        if (cached?.data) {
+                            if (pointsInfo) {
+                                // Store per-night value for display consistency
+                                cached.data.lowestPoints = pointsInfo.avgPerNight;
+                                cached.data.pointsInfo = pointsInfo;
+                                log('Updated', hotelCode, ':',
+                                    pointsInfo.avgPerNight, 'pts/night,',
+                                    pointsInfo.totalPoints, 'total for', searchParams.nights, 'nights',
+                                    '(' + pointsInfo.roomType + ')');
+                            } else {
+                                // No points availability (some night lacks points for all room types)
+                                cached.data.lowestPoints = null;
+                                cached.data.pointsInfo = null;
+                                log('Updated', hotelCode, ': no points availability (checked all room types)');
+                            }
+                            cached.data.nights = searchParams.nights;
+                            hotelCache.set(hotelCode, cached);
+
+                            // Re-process to update display
+                            const card = document.querySelector(`a[href*="/shop/rooms/${spiritCode}"]`)?.closest('[class*="HotelCard_info_section_rate_content"]');
+                            if (card) {
+                                card.removeAttribute('data-stayvalue-processed');
+                                card.querySelector('.stayvalue-display')?.remove();
+                            }
+                            debouncedProcess();
+                        }
+                    }
+                });
+            }, index * (staggerDelay + Math.random() * 100));
+        });
     }
 
     // DOM init - runs when DOM is ready
@@ -1383,6 +1720,11 @@
         injectStyles();
         fetchExchangeRates();
         setupIataObserver();
+
+        // For Hyatt: try to extract data from embedded scripts
+        if (activeAdapter.name === 'Hyatt') {
+            setTimeout(extractHyattDataFromScripts, 500);
+        }
 
         setTimeout(processHotelCards, 1500);
 
