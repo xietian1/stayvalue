@@ -7,6 +7,8 @@
 // @match        https://www.marriott.com/*
 // @match        https://www.hyatt.com/*
 // @match        https://www.hilton.com/*
+// @updateURL    https://raw.githubusercontent.com/chaoxu/stayvalue/main/stayvalue.user.js
+// @downloadURL  https://raw.githubusercontent.com/chaoxu/stayvalue/main/stayvalue.user.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
