@@ -1414,11 +1414,11 @@
             return { bestRate: 'points', cashCost: null, pointsCost: pointsEffectiveCost, savings: null };
         }
 
-        const savings = Math.abs(cashEffective - pointsEffectiveCost);
+        
         if (pointsEffectiveCost < cashEffective) {
-            return { bestRate: 'points', cashCost: cashEffective, pointsCost: pointsEffectiveCost, savings };
+            return { bestRate: 'points', cashCost: cashEffective, pointsCost: pointsEffectiveCost, savings: cashEffective - pointsEffectiveCost };
         } else {
-            return { bestRate: 'cash', cashCost: cashEffective, pointsCost: pointsEffectiveCost, savings };
+            return { bestRate: 'cash', cashCost: cashEffective, pointsCost: pointsEffectiveCost, savings: null };
         }
     }
 
